@@ -1,0 +1,381 @@
+# --- Reproducibility / Quiet logs -------------------------------------------
+seed = 1
+import os
+os.environ["PYTHONHASHSEED"] = str(seed)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"   # silence TF INFO/WARN
+
+import random
+random.seed(seed)
+
+import numpy as np
+np.random.seed(seed)
+
+import tensorflow as tf
+tf.random.set_seed(seed)
+
+# --- Environment -------------------------------------------------------------
+from environment import Environment
+data_dir = './data'
+variant = 0
+env = Environment(variant, data_dir)
+
+# --- TensorFlow / Keras (unified) -------------------------------------------
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+
+from collections import deque
+import warnings
+
+# --- Matplotlib: quiet + safe font ------------------------------------------
+import matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+
+# ======= Observation-Encoding (77D) with normalization =======
+def encode_obs(obs, H=5, W=5, max_steps=200, load_cap=1.0):
+    """
+    Normalizes scalars:
+      - step_count / max_steps in [0,1]
+      - agent_load / load_cap in ~[0,1]
+      - item_age normalized per-state to its max (>=1)
+    """
+    step_count, agent_loc, agent_load, item_locs, item_times = obs
+
+    agent_grid = np.zeros((H, W), dtype=np.float32)
+    r, c = agent_loc
+    agent_grid[r, c] = 1.0
+
+    item_presence = np.zeros((H, W), dtype=np.float32)
+    item_age = np.zeros((H, W), dtype=np.float32)
+    for (ir, ic), age in zip(item_locs, item_times):
+        item_presence[ir, ic] = 1.0
+        item_age[ir, ic] = float(age)
+
+    # per-state normalization for ages (avoid div0)
+    age_max = max(1.0, float(item_age.max()))
+    item_age = item_age / age_max
+
+    step_norm = float(step_count) / float(max_steps)
+    load_norm = float(agent_load) / max(1.0, float(load_cap))
+
+    scalars = np.array([step_norm, load_norm], dtype=np.float32)
+
+    return np.concatenate(
+        [agent_grid.ravel(), item_presence.ravel(), item_age.ravel(), scalars],
+        axis=0
+    )
+
+
+# ======= Minimal renderer (disabled during training) =======
+class PrettyRenderer:
+    def __init__(self, env, fps=8, render_every=2):
+        self.env = env
+        self.pause = 1.0 / max(1e-3, fps)
+        self.render_every = max(1, int(render_every))
+        self.fig = None; self.ax = None
+        self.agent_artist = None
+        self.target_artist = None
+        self.item_artists = []
+
+    def _setup_canvas(self):
+        if self.fig is not None: return
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(5.6, 5.6))
+        ax = self.ax
+        ax.set_aspect('equal')
+        H, W = self.env.vertical_cell_count, self.env.horizontal_cell_count
+        ax.set_xlim(-0.5, W - 0.5); ax.set_ylim(H - 0.5, -0.5)
+        ax.set_xticks(np.arange(-.5, W, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, H, 1), minor=True)
+        ax.grid(which='minor', linestyle='-', linewidth=0.6, alpha=0.28)
+        ax.set_xticks([]); ax.set_yticks([])
+        for r in range(H):
+            for c in range(W):
+                is_hole = (self.env.variant == 2) and ((r, c) not in self.env.eligible_cells)
+                col = (0.965, 0.965, 1.0) if not is_hole else (0.85, 0.85, 0.88)
+                ax.add_patch(Rectangle((c - 0.5, r - 0.5), 1, 1, facecolor=col, edgecolor='none', zorder=0))
+        tr, tc = self.env.target_loc
+        self.target_artist = self.ax.text(tc, tr, "T", ha='center', va='center', fontsize=18, fontweight='bold', zorder=3)
+        ar, ac = self.env.agent_loc
+        self.agent_artist  = self.ax.text(ac, ar, "A", ha='center', va='center', fontsize=20, color='blue', fontweight='bold', zorder=4)
+
+    def draw(self, step, ep_return, action=None):
+        if step % self.render_every != 0: return
+        self._setup_canvas()
+        ax = self.ax
+        for it in self.item_artists: it.remove()
+        self.item_artists.clear()
+        for (ir, ic) in self.env.item_locs:
+            txt = ax.text(ic, ir, "*", ha='center', va='center', fontsize=18, color='orange', zorder=3)
+            self.item_artists.append(txt)
+        ar, ac = self.env.agent_loc
+        self.agent_artist.set_position((ac, ar))
+        names = {0: "idle", 1: "up", 2: "right", 3: "down", 4: "left"}
+        ax.set_title(f"Step {step} | Return: {ep_return:.2f} | Action: {names.get(action,'-')}", fontsize=11, pad=8)
+        plt.pause(self.pause)
+
+    def close(self):
+        plt.ioff()
+        if self.fig is not None: plt.show()
+
+
+# ======= Template-Environment wrapper =======================================
+class GymEnvironment:
+    def __init__(self, env_id, save_path, render=False, variant=0, data_dir="./data",
+                 pretty_render=False, fps=8, render_every=2):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.max_timesteps = getattr(self.env, "episode_steps", 200)
+        self.save_path = save_path
+        self.pretty_render = pretty_render
+        self.fps = fps
+        self.render_every = render_every
+
+    def trainDQN(self, agent, no_episodes):
+        rew = self.runDQN(agent, no_episodes, training=True, evaluation=False)
+        agent.model.save_weights(os.path.join(self.save_path, "dueling_double_dqn.weights.h5"), overwrite=True)
+        return rew
+
+    def runDQN(self, agent, no_episodes, training=False, evaluation=False):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+        viz = PrettyRenderer(self.env, fps=self.fps, render_every=self.render_every) \
+              if (self.pretty_render and training) else None
+
+        update_every = 4
+        per_update_steps = 2  # do a tiny bit more work each update
+
+        # Normalize config for encoder
+        load_cap = getattr(self.env, "capacity", 1.0)
+        H, W = self.env.vertical_cell_count, self.env.horizontal_cell_count
+
+        for episode in range(no_episodes):
+            mode = "training" if training else "validation"
+            obs = self.env.reset(mode=mode)
+            state = encode_obs(obs, H, W, self.max_timesteps, load_cap).reshape(1, -1)
+            done = 0; rwd = 0.0; t = 0
+            if viz: viz.draw(step=t, ep_return=rwd, action=None)
+            step_since_update = 0
+
+            while not done:
+                action = agent.select_action(state, training)
+
+                # (Fix #6): remove anti-idle randomization during training
+
+                reward, next_obs, done = self.env.step(action)
+                next_state = encode_obs(next_obs, H, W, self.max_timesteps, load_cap).reshape(1, -1)
+                rwd += reward
+
+                # (Fix #2): mark time-limit truncations as terminal
+                truncated = (t + 1 >= self.max_timesteps)
+                terminal_flag = float(done or truncated)
+
+                if training and not evaluation:
+                    agent.record(state, action, reward, next_state, terminal_flag)
+                    step_since_update += 1
+                    if step_since_update % update_every == 0:
+                        for _ in range(per_update_steps):
+                            agent.update_weights()
+
+                state = next_state; t += 1
+                if viz: viz.draw(step=t, ep_return=rwd, action=action)
+                if truncated: break
+
+            rew[episode] = rwd
+            if not evaluation:
+                if training: print(f"episode: {episode + 1}/{no_episodes} | score: {rwd:.2f} | e: {agent.epsilon:.3f}")
+                else:        print(f"episode: {episode + 1}/{no_episodes} | score: {rwd:.2f}")
+            else:
+                if episode % 10 == 0: print(f"Progress: {episode} %")
+            if training: agent.update_epsilon()
+
+        if viz: viz.close()
+        return rew
+
+
+# ======= Dueling + Double DQN Agent (soft target; strict-greedy eval) =======
+class DQN_Agent:
+    def __init__(self, state_size, no_of_actions, agent_hyperparameters={}, old_model_path=''):
+        self.state_size   = int(state_size)
+        self.action_size  = int(no_of_actions)
+
+        # ---- core hparams
+        self.gamma         = agent_hyperparameters.get('gamma', 0.99)
+        self.epsilon       = agent_hyperparameters.get('epsilon', 1.0)
+        self.batch_size    = agent_hyperparameters.get('batch_size', 32)
+        self.epsilon_min   = agent_hyperparameters.get('epsilon_min', 0.05)
+        self.epsilon_decay = agent_hyperparameters.get('epsilon_decay', 0.995)
+        self.units         = agent_hyperparameters.get('units', 64)
+
+        # ---- slower soft target update rate
+        self.tau = agent_hyperparameters.get('tau', 0.001)
+
+        # networks
+        self.model = self._build_model(self.state_size, self.action_size, self.units, old_model_path)
+        self.target_model = self._build_model(self.state_size, self.action_size, self.units)
+        self.target_model.set_weights(self.model.get_weights())
+
+        # replay buffer
+        self.memory = deque(maxlen=50000)
+        self.learn_start = max(5000, 5 * self.batch_size)   # (Fix #3)
+
+        self.total_updates = 0
+
+    def _build_model(self, state_size, action_size, units, old_model_path=''):
+        inp = Input(shape=(state_size,))
+        x = Dense(units, activation='relu')(inp)
+        x = Dense(units, activation='relu')(x)
+
+        # Dueling heads
+        adv = Dense(units, activation='relu')(x)
+        adv = Dense(action_size)(adv)   # linear advantages
+
+        val = Dense(units, activation='relu')(x)
+        val = Dense(1)(val)             # scalar value
+
+        def combine_streams(tensors):
+            v, a = tensors
+            a_mean = tf.reduce_mean(a, axis=1, keepdims=True)
+            return v + (a - a_mean)
+
+        q = Lambda(combine_streams, name="dueling_combine")([val, adv])
+
+        model = Model(inputs=inp, outputs=q)
+        model.compile(
+            optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),   # (Fix #4)
+            loss=Huber(delta=1.0),
+            run_eagerly=False
+        )
+        if old_model_path:
+            model.load_weights(old_model_path)
+        return model
+
+    # ---- Strict-greedy when training=False
+    def select_action(self, state, training=True):
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.randint(self.action_size))
+        q = self.model.predict(state, verbose=0)[0]
+        return int(np.argmax(q))
+
+    def record(self, state, action, reward, next_state, done):
+        self.memory.append((state.copy(), int(action), float(reward), next_state.copy(), float(done)))
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        w  = self.model.get_weights()
+        tw = self.target_model.get_weights()
+        self.target_model.set_weights([self.tau * wi + (1.0 - self.tau) * twi for wi, twi in zip(w, tw)])
+
+    # --- Double DQN update + soft targets
+    def update_weights(self):
+        if len(self.memory) < self.learn_start:
+            return
+
+        # sample with replacement (slightly lower variance)
+        idxs = np.random.randint(len(self.memory), size=self.batch_size)
+        batch = [self.memory[i] for i in idxs]
+        S  = np.concatenate([b[0] for b in batch], axis=0)
+        A  = np.array([b[1] for b in batch], dtype=np.int32)
+        R  = np.array([b[2] for b in batch], dtype=np.float32)
+        NS = np.concatenate([b[3] for b in batch], axis=0)
+        D  = np.array([b[4] for b in batch], dtype=np.float32)
+
+        # Double DQN: online selects, target evaluates
+        q_next_online = self.model.predict(NS, verbose=0)
+        best_next_actions = np.argmax(q_next_online, axis=1)
+        q_next_target = self.target_model.predict(NS, verbose=0)
+        best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions]
+        Tgt = R + self.gamma * best_next_q * (1.0 - D)
+
+        q_curr = self.model.predict(S, verbose=0)
+        q_curr[np.arange(self.batch_size), A] = Tgt
+
+        self.model.train_on_batch(S, q_curr)
+
+        # soft target update each training step
+        self._soft_update_target()
+        self.total_updates += 1
+
+
+# ---------- Average-Reward evaluation ----------------------------------------
+def evaluate_average_reward(agent, variant, data_dir, episodes=150, mode="validation"):
+    env = Environment(variant, data_dir)
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+    load_cap = getattr(env, "capacity", 1.0)
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    total = 0.0
+    for _ in range(episodes):
+        obs = env.reset(mode)
+        s = encode_obs(obs, H, W, max_steps, load_cap).reshape(1, -1)
+        done = 0; ep_ret = 0.0; steps = 0
+        while not done and steps < max_steps:
+            a = agent.select_action(s, training=False)  # strict greedy
+            r, nxt, done = env.step(a)
+            s = encode_obs(nxt, H, W, max_steps, load_cap).reshape(1, -1)
+            ep_ret += r; steps += 1
+        total += ep_ret
+    return total / float(episodes)
+
+
+# ======= Main ================================================================
+if __name__ == "__main__":
+    state_size = 77
+    no_of_actions = 5
+
+    DATA_DIR = "./data"
+    VARIANT = 0
+
+    agent_hyperparameters = {
+        'gamma': 0.8,
+        'epsilon': 1.0,
+        'batch_size': 32,
+        'epsilon_min': 0.05,
+        'epsilon_decay': 0.995,
+        'units': 64,
+
+        # slower soft target update rate
+        'tau': 0.001,
+    }
+
+    agent = DQN_Agent(state_size, no_of_actions, agent_hyperparameters)
+
+    # ---- TRAIN ----
+    wd = os.getcwd()
+    save_folder = os.path.join(wd, 'save_folder')
+    os.makedirs(save_folder, exist_ok=True)
+
+    TRAIN_EPISODES = 500
+    env_train = GymEnvironment(
+        'custom_env', save_folder,
+        render=False,
+        variant=VARIANT, data_dir=DATA_DIR,
+        pretty_render=False,
+        fps=8, render_every=2
+    )
+    rew_train = env_train.trainDQN(agent, TRAIN_EPISODES)
+
+    # ---- PLOT ----
+    plt.figure(figsize=(7, 3.5))
+    plt.plot(rew_train, linewidth=1.5)
+    plt.title("Training reward per episode (Dueling Double DQN)")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.tight_layout()
+    plt.show()
+
+    # ---- EVALUATION ----
+    EVAL_EPISODES = 150
+    avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=EVAL_EPISODES, mode="validation")
+    avg_tst = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=EVAL_EPISODES, mode="testing")
+    print("# agent greedy evaluation: average reward")
+    print(f"#   - variant {VARIANT}: validation {avg_val:.3f}, testing {avg_tst:.3f}")
