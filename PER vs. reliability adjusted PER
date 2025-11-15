@@ -1,0 +1,1065 @@
+# --- Reproducibility / Quiet logs -------------------------------------------
+seed = 1
+import os
+
+# >>> STRIKTERES SILENCING (muss VOR dem TF-Import passieren!)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # 0=all,1=INFO,2=WARNING,3=ERROR
+os.environ["AUTOGRAPH_VERBOSITY"] = "0"
+# optional: reduziert Multi-Thread-Noise bei XLA/Eigen
+# os.environ["TF_XLA_FLAGS"] = "--xla_cpu_multi_thread_eigen=false --xla_gpu_multi_thread_eigen=false"
+os.environ.pop("TF_XLA_FLAGS", None)
+os.environ["PYTHONHASHSEED"] = str(seed)
+os.environ["TF_DETERMINISTIC_OPS"] = "1"   # prefer deterministic kernels where available
+
+import random
+random.seed(seed)
+
+import numpy as np
+np.random.seed(seed)
+
+# Python-Logger für TF auf ERROR setzen (zusätzlich zu TF_CPP_MIN_LOG_LEVEL)
+import logging
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+import tensorflow as tf
+tf.random.set_seed(seed)
+tf.get_logger().setLevel("ERROR")
+try:
+    tf.autograph.set_verbosity(0)
+except Exception:
+    pass
+
+# (GPU) safer defaults
+gpus = tf.config.list_physical_devices('GPU')
+for gpu in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
+
+# --- Environment -------------------------------------------------------------
+from environment import Environment
+data_dir = './data'
+variant = 0
+env = Environment(variant, data_dir)
+
+# --- TensorFlow / Keras (unified) -------------------------------------------
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+
+from collections import deque   # (nicht mehr nötig, aber harmless)
+import warnings
+
+# --- Matplotlib: quiet + safe font ------------------------------------------
+import matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+# ======= Plot helpers for fair comparison ===================================
+GLOBAL_YLIM = (-130, 250)   # keep identical y-axis across runs
+
+def moving_average(x, window):
+    window = int(max(1, window))
+    if len(x) < window:
+        return np.array([]), np.array([])
+    kern = np.ones(window, dtype=np.float32) / float(window)
+    y = np.convolve(x, kern, mode='valid')
+    xs = np.arange(window - 1, window - 1 + len(y))
+    return xs, y
+
+def summarize_rewards(rew, tail=50):
+    tail = max(1, min(tail, len(rew)))
+    last = rew[-tail:]
+    x = np.arange(len(rew))[-tail:]
+    slope = float(np.polyfit(x, last, 1)[0])
+    return {
+        "episodes": int(len(rew)),
+        "mean_last": float(np.mean(last)),
+        "std_last":  float(np.std(last)),
+        "max":       float(np.max(rew)),
+        "slope_last": slope
+    }
+
+# ======= Observation-Encoding (77D) with normalization ======================
+def encode_obs(obs, H=5, W=5, max_steps=200, load_cap=1.0):
+    step_count, agent_loc, agent_load, item_locs, item_times = obs
+
+    agent_grid = np.zeros((H, W), dtype=np.float32)
+    r, c = agent_loc
+    agent_grid[r, c] = 1.0
+
+    item_presence = np.zeros((H, W), dtype=np.float32)
+    item_age = np.zeros((H, W), dtype=np.float32)
+    for (ir, ic), age in zip(item_locs, item_times):
+        item_presence[ir, ic] = 1.0
+        item_age[ir, ic] = float(age)
+
+    age_max = max(1.0, float(item_age.max()))
+    item_age = item_age / age_max
+
+    step_norm = float(step_count) / float(max_steps)
+    load_norm = float(agent_load) / max(1.0, float(load_cap))
+
+    scalars = np.array([step_norm, load_norm], dtype=np.float32)
+
+    return np.concatenate(
+        [agent_grid.ravel(), item_presence.ravel(), item_age.ravel(), scalars],
+        axis=0
+    )
+
+# ======= Minimal renderer (disabled during training) =========================
+class PrettyRenderer:
+    def __init__(self, env, fps=8, render_every=2):
+        self.env = env
+        self.pause = 1.0 / max(1e-3, fps)
+        self.render_every = max(1, int(render_every))
+        self.fig = None; self.ax = None
+        self.agent_artist = None
+        self.target_artist = None
+        self.item_artists = []
+
+    def _setup_canvas(self):
+        if self.fig is not None: return
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(5.6, 5.6))
+        ax = self.ax
+        ax.set_aspect('equal')
+        H, W = self.env.vertical_cell_count, self.env.horizontal_cell_count
+        ax.set_xlim(-0.5, W - 0.5); ax.set_ylim(H - 0.5, -0.5)
+        ax.set_xticks(np.arange(-.5, W, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, H, 1), minor=True)
+        ax.grid(which='minor', linestyle='-', linewidth=0.6, alpha=0.28)
+        ax.set_xticks([]); ax.set_yticks([])
+        for r in range(H):
+            for c in range(W):
+                is_hole = (self.env.variant == 2) and ((r, c) not in self.env.eligible_cells)
+                col = (0.965, 0.965, 1.0) if not is_hole else (0.85, 0.85, 0.88)
+                ax.add_patch(Rectangle((c - 0.5, r - 0.5), 1, 1,
+                                       facecolor=col, edgecolor='none', zorder=0))
+        tr, tc = self.env.target_loc
+        self.target_artist = self.ax.text(
+            tc, tr, "T", ha='center', va='center',
+            fontsize=18, fontweight='bold', zorder=3
+        )
+        ar, ac = self.env.agent_loc
+        self.agent_artist  = self.ax.text(
+            ac, ar, "A", ha='center', va='center',
+            fontsize=20, color='blue', fontweight='bold', zorder=4
+        )
+
+    def draw(self, step, ep_return, action=None):
+        if step % self.render_every != 0: return
+        self._setup_canvas()
+        ax = self.ax
+        for it in self.item_artists: it.remove()
+        self.item_artists.clear()
+        for (ir, ic) in self.env.item_locs:
+            txt = ax.text(ic, ir, "*", ha='center', va='center',
+                          fontsize=18, color='orange', zorder=3)
+            self.item_artists.append(txt)
+        ar, ac = self.env.agent_loc
+        self.agent_artist.set_position((ac, ar))
+        names = {0: "idle", 1: "up", 2: "right", 3: "down", 4: "left"}
+        ax.set_title(
+            f"Step {step} | Return: {ep_return:.2f} | Action: {names.get(action,'-')}",
+            fontsize=11, pad=8
+        )
+        plt.pause(self.pause)
+
+    def close(self):
+        plt.ioff()
+        if self.fig is not None:
+            plt.show()
+            plt.close(self.fig)
+
+# ======= Template-Environment wrapper =======================================
+class GymEnvironment:
+    def __init__(self, env_id, save_path, render=False, variant=0, data_dir="./data",
+                 pretty_render=False, fps=8, render_every=2):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.max_timesteps = getattr(self.env, "episode_steps", 200)
+        self.save_path = save_path
+        self.pretty_render = pretty_render
+        self.fps = fps
+        self.render_every = render_every
+
+    def trainDQN(self, agent, no_episodes):
+        rew = self.runDQN(agent, no_episodes, training=True, evaluation=False)
+        agent.model.save_weights(
+            os.path.join(self.save_path, "dueling_double_dqn.weights.h5"),
+            overwrite=True
+        )
+        return rew
+
+    def runDQN(self, agent, no_episodes, training=False, evaluation=False):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+        viz = PrettyRenderer(self.env, fps=self.fps, render_every=self.render_every) \
+              if (self.pretty_render and training) else None
+
+        # Update-Schema
+        update_every = 1
+        per_update_steps = 1
+
+        # Normalize config for encoder
+        load_cap = getattr(self.env, "capacity", 1.0)
+        H, W = self.env.vertical_cell_count, self.env.horizontal_cell_count
+
+        for episode in range(no_episodes):
+            mode = "training" if training else "validation"
+            obs = self.env.reset(mode=mode)
+            state = encode_obs(obs, H, W, self.max_timesteps, load_cap).reshape(1, -1)
+            done = 0; rwd = 0.0; t = 0
+            if viz: viz.draw(step=t, ep_return=rwd, action=None)
+            step_since_update = 0
+
+            while not done:
+                action = agent.select_action(state, training)
+
+                reward, next_obs, done = self.env.step(action)
+                next_state = encode_obs(next_obs, H, W, self.max_timesteps, load_cap).reshape(1, -1)
+                rwd += reward
+
+                truncated = (t + 1 >= self.max_timesteps)
+                # Do NOT mark time-limit truncation as terminal (bootstrap)
+                terminal_flag = float(done)
+
+                if training and not evaluation:
+                    # 1-step learning: disc = gamma
+                    agent.record(state, action, reward, next_state, terminal_flag)
+                    agent.env_steps += 1
+                    if hasattr(agent, "memory") and hasattr(agent.memory, "set_progress"):
+                        agent.memory.set_progress(agent.env_steps)
+
+                    step_since_update += 1
+                    if step_since_update % update_every == 0:
+                        for _ in range(per_update_steps):
+                            agent.update_weights()
+
+                state = next_state; t += 1
+                if viz: viz.draw(step=t, ep_return=rwd, action=action)
+                if truncated:
+                    break
+
+            rew[episode] = rwd
+            if not evaluation:
+                if training:
+                    print(f"episode: {episode + 1}/{no_episodes} | "
+                          f"score: {rwd:.2f} | e: {agent.epsilon:.3f}")
+                else:
+                    print(f"episode: {episode + 1}/{no_episodes} | score: {rwd:.2f}")
+            else:
+                if episode % 10 == 0:
+                    print(f"Progress: {episode} %")
+            if training:
+                agent.update_epsilon()
+
+        if viz: viz.close()
+        return rew
+
+# ======================= Replay buffers (Uniform + PER + ReaPER) =============
+class UniformReplayBuffer:
+    """Matches the PER API so we can swap with a flag."""
+    def __init__(self, state_dim, capacity=50_000):
+        self.capacity = capacity
+        self.ptr = 0
+        self.n = 0
+        self.states      = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions     = np.zeros((capacity,), dtype=np.int64)
+        self.rewards     = np.zeros((capacity,), dtype=np.float32)     # 1-step reward
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones       = np.zeros((capacity,), dtype=np.float32)     # terminal flag
+        self.discounts   = np.zeros((capacity,), dtype=np.float32)     # gamma
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d, disc):
+        i = self.ptr
+        self.states[i]      = s
+        self.actions[i]     = a
+        self.rewards[i]     = r
+        self.next_states[i] = ns
+        self.dones[i]       = d
+        self.discounts[i]   = disc
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        idxs = np.random.randint(self.n, size=batch_size, dtype=np.int64)
+        weights = np.ones((batch_size,), dtype=np.float32)
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            self.discounts[idxs],
+            idxs,
+            weights
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        pass  # no-op for uniform
+
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity <<= 1
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def total(self):
+        return float(self.tree[1])
+
+    def add(self, p: float, idx: int):
+        i = idx + self.capacity
+        delta = p - self.tree[i]
+        self.tree[i] = p
+        i //= 2
+        while i >= 1:
+            self.tree[i] += delta
+            i //= 2
+
+    def find_prefixsum_idx(self, mass: float) -> int:
+        i = 1
+        while i < self.capacity:
+            left = 2 * i
+            if self.tree[left] >= mass:
+                i = left
+            else:
+                mass -= self.tree[left]
+                i = left + 1
+        return i - self.capacity
+
+    def get_leaf(self, idx: int) -> float:
+        return float(self.tree[self.capacity + idx])
+
+
+class PrioritizedReplayBuffer:
+    def __init__(self, state_dim, capacity=50_000, alpha=0.6, beta0=0.4,
+                 beta_final=1.0, beta_anneal_steps=200_000, eps=1e-6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.eps = eps
+        self.beta0 = beta0
+        self.beta_final = beta_final
+        self.beta_anneal_steps = max(1, beta_anneal_steps)
+        self.ptr = 0
+        self.n = 0
+
+        self.states      = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions     = np.zeros((capacity,), dtype=np.int64)
+        self.rewards     = np.zeros((capacity,), dtype=np.float32)     # 1-step reward
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones       = np.zeros((capacity,), dtype=np.float32)     # terminal flag
+        self.discounts   = np.zeros((capacity,), dtype=np.float32)     # gamma
+
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+
+        self._beta = beta0
+
+    def set_progress(self, steps: int):
+        t = min(1.0, steps / float(self.beta_anneal_steps))
+        self._beta = (1.0 - t) * self.beta0 + t * self.beta_final
+
+    @property
+    def beta(self):
+        return float(self._beta)
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d, disc):
+        i = self.ptr
+        self.states[i]      = s
+        self.actions[i]     = a
+        self.rewards[i]     = r
+        self.next_states[i] = ns
+        self.dones[i]       = d
+        self.discounts[i]   = disc
+        p = (self.max_priority + self.eps) ** self.alpha
+        self.sumtree.add(p, i)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        if self.n == 0 or self.sumtree.total() <= 0.0:
+            idxs = np.random.randint(max(1, self.n), size=batch_size, dtype=np.int64)
+            w = np.ones((batch_size,), dtype=np.float32)
+            return (
+                self.states[idxs], self.actions[idxs], self.rewards[idxs],
+                self.next_states[idxs], self.dones[idxs], self.discounts[idxs],
+                idxs, w
+            )
+
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(mass)
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+        idxs = np.asarray(idxs, dtype=np.int64)
+
+        p = np.array([self.sumtree.get_leaf(int(i)) for i in idxs], dtype=np.float32)
+        p = np.clip(p, 1e-12, None)
+        P = p / total
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)   # keep normalized IS weights
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            self.discounts[idxs],
+            idxs,
+            w.astype(np.float32)
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        prios = (np.abs(td_errors) + max(self.eps, 1e-5)) ** self.alpha
+        prios = np.maximum(prios, 1e-6)
+        self.max_priority = max(self.max_priority, float(np.max(prios)))
+        for i, p in zip(idxs, prios):
+            self.sumtree.add(float(p), int(i))
+
+
+# ===================== ReaPER: Reliability-adjusted PER ======================
+class ReaPERReplayBuffer:
+    """
+    ReaPER: reliability-adjusted PER (Pleiss et al., 2025).
+    Priority p_t ∝ Ψ_t = (|δ_t|^α) * (R_t^ω), wobei R_t die "Reliability" des Targets ist:
+
+        R_t = 1 - (Sum_{i>t in same episode} |δ_i|) / denom
+
+    Für laufende Episoden wird denom konservativ durch F ersetzt:
+        F = max_episodes Sum_{i in episode} |δ_i|
+
+    Importance Sampling Gewichte wie in PER: w_t ∝ (1 / (N * p_t))^β
+    """
+    def __init__(
+        self,
+        state_dim,
+        capacity=50_000,
+        alpha=0.6,
+        beta0=0.4,
+        beta_final=1.0,
+        beta_anneal_steps=200_000,
+        omega=0.5,
+        eps=1e-6
+    ):
+        self.capacity = int(capacity)
+        self.alpha = float(alpha)
+        self.omega = float(omega)
+        self.eps = float(eps)
+
+        self.beta0 = float(beta0)
+        self.beta_final = float(beta_final)
+        self.beta_anneal_steps = max(1, int(beta_anneal_steps))
+        self._beta = self.beta0
+
+        # circular buffer ptr
+        self.ptr = 0
+        self.n = 0
+
+        # data
+        self.states      = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions     = np.zeros((capacity,), dtype=np.int64)
+        self.rewards     = np.zeros((capacity,), dtype=np.float32)   # 1-step reward
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones       = np.zeros((capacity,), dtype=np.float32)   # terminal flag
+        self.discounts   = np.zeros((capacity,), dtype=np.float32)   # gamma
+
+        # TD-error cache (absolute), start at 1 so first sampling ≈ uniform
+        self.abs_tde     = np.ones((capacity,), dtype=np.float32)
+
+        # Episode bookkeeping
+        self.episode_id        = np.full((capacity,), -1, dtype=np.int64)
+        self.prev_in_episode   = np.full((capacity,), -1, dtype=np.int64)
+        self.next_in_episode   = np.full((capacity,), -1, dtype=np.int64)
+        self.ep_last_index     = {}      # ep_id -> last index in buffer
+        self.ep_closed         = {}      # ep_id -> bool
+        self.ep_total_abs_tde  = {}      # ep_id -> sum |δ|
+        self.current_ep_id     = 0
+        self.current_ep_tail   = -1      # last index for the current (open) episode
+
+        # SumTree for priorities
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+
+    # ---- beta annealing -----------------------------------------------------
+    def set_progress(self, steps: int):
+        t = min(1.0, steps / float(self.beta_anneal_steps))
+        self._beta = (1.0 - t) * self.beta0 + t * self.beta_final
+
+    @property
+    def beta(self):
+        return float(self._beta)
+
+    def __len__(self):
+        return self.n
+
+    # ---- Episode Management -------------------------------------------------
+    def _start_new_episode(self):
+        self.current_ep_id += 1
+        self.current_ep_tail = -1
+        self.ep_closed[self.current_ep_id] = False
+        self.ep_total_abs_tde[self.current_ep_id] = 0.0
+
+    def _close_episode_if_done(self, idx, done_flag: float):
+        """
+        Wenn der 1-step "done"-Flag 1.0 ist, markieren wir diese Episode als "closed"
+        (wie im Paper: terminal transitions liefern verlässliche Targets).
+        """
+        ep = int(self.episode_id[idx])
+        if done_flag >= 1.0 and not self.ep_closed.get(ep, False):
+            self.ep_closed[ep] = True
+
+    def _link_into_episode(self, idx):
+        # link new index into current episode chain
+        if self.current_ep_tail != -1:
+            self.prev_in_episode[idx] = self.current_ep_tail
+            self.next_in_episode[self.current_ep_tail] = idx
+        self.current_ep_tail = idx
+
+    # ---- Add Transition -----------------------------------------------------
+    def add(self, s, a, r, ns, d, disc):
+        i = self.ptr
+
+        # Wenn wir etwas überschreiben, aus alter Episode rausnehmen (best effort)
+        old_ep = int(self.episode_id[i])
+        if self.n == self.capacity and old_ep >= 0:
+            self.ep_total_abs_tde[old_ep] = max(
+                0.0,
+                float(self.ep_total_abs_tde.get(old_ep, 0.0) - self.abs_tde[i])
+            )
+            prev_idx = self.prev_in_episode[i]
+            next_idx = self.next_in_episode[i]
+            if prev_idx != -1:
+                self.next_in_episode[prev_idx] = next_idx
+            if next_idx != -1:
+                self.prev_in_episode[next_idx] = prev_idx
+            if self.ep_last_index.get(old_ep, -1) == i:
+                self.ep_last_index[old_ep] = prev_idx
+            self.prev_in_episode[i] = -1
+            self.next_in_episode[i] = -1
+
+        # write data
+        self.states[i]      = s
+        self.actions[i]     = a
+        self.rewards[i]     = r
+        self.next_states[i] = ns
+        self.dones[i]       = d
+        self.discounts[i]   = disc
+
+        # Episode id assignment
+        if self.current_ep_tail == -1 or (
+            self.current_ep_tail >= 0 and
+            self.ep_closed.get(self.episode_id[self.current_ep_tail], False)
+        ):
+            self._start_new_episode()
+        ep = self.current_ep_id
+        self.episode_id[i] = ep
+        self._link_into_episode(i)
+        self.ep_last_index[ep] = i
+
+        # initial TD-error hoch = max_priority (damit früh gesampled)
+        self.abs_tde[i] = max(self.abs_tde[i], self.max_priority)
+        self.ep_total_abs_tde[ep] = float(self.ep_total_abs_tde.get(ep, 0.0) + self.abs_tde[i])
+
+        # Priority zunächst wie PER: |δ|^α (R wird später präzisiert)
+        priority = float((self.abs_tde[i] + self.eps) ** self.alpha)
+        self.sumtree.add(priority, i)
+        self.max_priority = max(self.max_priority, priority)
+
+        # advance ptr
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+        # Episode ggf. schließen
+        self._close_episode_if_done(i, d)
+
+    # ---- Reliability-Helpers -----------------------------------------------
+    def _downstream_abs_sum(self, idx):
+        ep = int(self.episode_id[idx])
+        total = 0.0
+        j = int(self.next_in_episode[idx])
+        while j != -1 and self.episode_id[j] == ep:
+            total += float(self.abs_tde[j])
+            j = int(self.next_in_episode[j])
+        return total
+
+    def _episode_total_abs(self, ep):
+        return float(self.ep_total_abs_tde.get(int(ep), 0.0))
+
+    def _F_max(self):
+        # max episodic sum across episodes (closed + open, konservative Schätzung)
+        if not self.ep_total_abs_tde:
+            return 1.0
+        return max(1.0, float(max(self.ep_total_abs_tde.values())))
+
+    def _reliability(self, idx):
+        """
+        R_t = 1 - (Sum_{i>t in same ep} |δ_i|) / denom
+        denom = Sum_{i in ep} |δ_i| falls Episode geschlossen,
+                ansonsten denom = max(F, Sum_ep) (konservativ, wie im Paper).
+        """
+        ep = int(self.episode_id[idx])
+        total_ep = self._episode_total_abs(ep)
+        downstream = self._downstream_abs_sum(idx)
+
+        if self.ep_closed.get(ep, False):
+            denom = max(total_ep, 1e-6)
+        else:
+            F = self._F_max()
+            denom = max(F, total_ep, 1e-6)
+
+        R = 1.0 - (downstream / denom)
+        return float(np.clip(R, 0.0, 1.0))
+
+    def _update_priority_for_index(self, idx):
+        R = self._reliability(idx)
+        Psi = (max(self.abs_tde[idx], 1e-12) ** self.alpha) * (max(R, 1e-12) ** self.omega)
+        Psi = float(max(Psi, 1e-6))
+        self.sumtree.add(Psi, int(idx))
+        self.max_priority = max(self.max_priority, Psi)
+
+    # ---- Sample -------------------------------------------------------------
+    def sample(self, batch_size):
+        if self.n == 0 or self.sumtree.total() <= 0.0:
+            idxs = np.random.randint(max(1, self.n), size=batch_size, dtype=np.int64)
+            w = np.ones((batch_size,), dtype=np.float32)
+            return (
+                self.states[idxs], self.actions[idxs], self.rewards[idxs],
+                self.next_states[idxs], self.dones[idxs], self.discounts[idxs],
+                idxs, w
+            )
+
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(mass)
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+        idxs = np.asarray(idxs, dtype=np.int64)
+
+        # Lazy-Update der Priorities (aktuelle δ, R) für gesampelte Indizes
+        for j in idxs:
+            self._update_priority_for_index(int(j))
+
+        total = max(self.sumtree.total(), 1e-12)
+        p_raw = np.array([self.sumtree.get_leaf(int(i)) for i in idxs], dtype=np.float32)
+        p_raw = np.clip(p_raw, 1e-12, None)
+        P = p_raw / total
+
+        # importance sampling
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            self.discounts[idxs],
+            idxs,
+            w.astype(np.float32)
+        )
+
+    # ---- Prioritäten-Update nach Training ----------------------------------
+    def update_priorities(self, idxs, td_errors):
+        """
+        Called after a training step.
+
+        1) aktualisieren |δ| pro Index,
+        2) passen episodische Summen an,
+        3) updaten Priorities für Index + direkten Vorgänger (R propagiert rückwärts).
+        """
+        idxs = np.asarray(idxs, dtype=np.int64)
+        abs_td = np.abs(td_errors).astype(np.float32)
+
+        # Update abs TDE + episodische Summe
+        for i, a in zip(idxs, abs_td):
+            ep = int(self.episode_id[int(i)])
+            delta = float(a - self.abs_tde[int(i)])
+            self.ep_total_abs_tde[ep] = float(
+                max(0.0, self.ep_total_abs_tde.get(ep, 0.0) + delta)
+            )
+            self.abs_tde[int(i)] = float(a)
+
+        # Priorities für diese Indizes + direkte Vorgänger neu berechnen
+        for i in idxs:
+            self._update_priority_for_index(int(i))
+            prev_idx = int(self.prev_in_episode[int(i)])
+            if prev_idx != -1 and self.episode_id[prev_idx] == self.episode_id[int(i)]:
+                self._update_priority_for_index(prev_idx)
+
+
+# ======= Dueling + Double DQN Agent (soft target; strict-greedy eval) =======
+class DQN_Agent:
+    def __init__(self, state_size, no_of_actions, agent_hyperparameters={}, old_model_path=''):
+        self.state_size   = int(state_size)
+        self.action_size  = int(no_of_actions)
+
+        # ---- core hparams
+        self.gamma         = agent_hyperparameters.get('gamma', 0.9)
+        self.epsilon       = agent_hyperparameters.get('epsilon', 1.0)
+        self.batch_size    = agent_hyperparameters.get('batch_size', 32)
+        self.epsilon_min   = agent_hyperparameters.get('epsilon_min', 0.10)
+        self.epsilon_decay = agent_hyperparameters.get('epsilon_decay', 0.995)
+        self.units         = agent_hyperparameters.get('units', 64)
+
+        # ---- toggles
+        self.use_per    = agent_hyperparameters.get('use_per', False)
+        self.use_reaper = agent_hyperparameters.get('use_reaper', True)
+
+        # ---- PER hparams
+        per_alpha   = agent_hyperparameters.get('per_alpha', 0.6)
+        per_beta0   = agent_hyperparameters.get('per_beta0', 0.4)
+        per_beta1   = agent_hyperparameters.get('per_beta1', 1.0)
+        per_eps     = agent_hyperparameters.get('per_eps', 1e-6)
+        per_anneal  = agent_hyperparameters.get('per_beta_anneal_steps', 50_000)
+
+        # ---- ReaPER hparams
+        reaper_alpha  = agent_hyperparameters.get('reaper_alpha', 0.6)
+        reaper_beta0  = agent_hyperparameters.get('reaper_beta0', 0.4)
+        reaper_beta1  = agent_hyperparameters.get('reaper_beta1', 1.0)
+        reaper_eps    = agent_hyperparameters.get('reaper_eps', 1e-6)
+        reaper_anneal = agent_hyperparameters.get('reaper_beta_anneal_steps', 50_000)
+        reaper_omega  = agent_hyperparameters.get('reaper_omega', 0.5)
+
+        # ---- faster soft target update rate
+        self.tau = agent_hyperparameters.get('tau', 0.01)
+
+        # networks
+        self.model = self._build_model(self.state_size, self.action_size, self.units, old_model_path)
+        self.target_model = self._build_model(self.state_size, self.action_size, self.units)
+        self.target_model.set_weights(self.model.get_weights())
+
+        # replay buffer Auswahl
+        if self.use_reaper:
+            self.memory = ReaPERReplayBuffer(
+                state_dim=self.state_size,
+                capacity=50_000,
+                alpha=reaper_alpha,
+                beta0=reaper_beta0,
+                beta_final=reaper_beta1,
+                beta_anneal_steps=reaper_anneal,
+                omega=reaper_omega,
+                eps=reaper_eps
+            )
+        elif self.use_per:
+            self.memory = PrioritizedReplayBuffer(
+                state_dim=self.state_size,
+                capacity=50_000,
+                alpha=per_alpha,
+                beta0=per_beta0,
+                beta_final=per_beta1,
+                beta_anneal_steps=per_anneal,
+                eps=per_eps,
+            )
+        else:
+            self.memory = UniformReplayBuffer(state_dim=self.state_size, capacity=50_000)
+
+        self.learn_start = max(10_000, 5 * self.batch_size)  # earlier start
+        self.total_updates = 0
+        self.env_steps = 0
+
+    def _build_model(self, state_size, action_size, units, old_model_path=''):
+        inp = Input(shape=(state_size,))
+        x = Dense(units, activation='relu')(inp)
+        x = Dense(units, activation='relu')(x)
+
+        # Dueling heads
+        adv = Dense(units, activation='relu')(x)
+        adv = Dense(action_size)(adv)
+
+        val = Dense(units, activation='relu')(x)
+        val = Dense(1)(val)
+
+        def combine_streams(tensors):
+            v, a = tensors
+            a_mean = tf.reduce_mean(a, axis=1, keepdims=True)
+            return v + (a - a_mean)
+
+        q = Lambda(combine_streams, name="dueling_combine")([val, adv])
+
+        model = Model(inputs=inp, outputs=q)
+        model.compile(
+            optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
+            loss=Huber(delta=1.0),
+            run_eagerly=False
+        )
+        if old_model_path:
+            model.load_weights(old_model_path)
+        return model
+
+    # ---- recording: 1-step transition --------------------------------------
+    def record(self, state, action, reward, next_state, done):
+        """
+        1-step TD:
+            target = r + gamma * Q(next) * (1 - done)
+        Wir speichern:
+            Rn = r
+            Disc = gamma
+            Dn = done
+        """
+        s  = state.reshape(-1)
+        ns = next_state.reshape(-1)
+        a  = int(action)
+        r  = float(reward)
+        d  = float(done)
+        disc = float(self.gamma)
+        self.memory.add(s, a, r, ns, d, disc)
+
+    # ---- action selection ----------------------------------------------------
+    def select_action(self, state, training=True):
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.randint(self.action_size))
+        q = self.model.predict(state, verbose=0)[0]
+        return int(np.argmax(q))
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        w  = self.model.get_weights()
+        tw = self.target_model.get_weights()
+        self.target_model.set_weights(
+            [self.tau * wi + (1.0 - self.tau) * twi for wi, twi in zip(w, tw)]
+        )
+
+    # --- Double DQN update + (optional) PER/ReaPER + soft targets -----------
+    def update_weights(self):
+        if len(self.memory) < self.learn_start:
+            return
+
+        S, A, Rn, NS, Dn, Disc, idxs, is_w = self.memory.sample(self.batch_size)
+
+        # Double DQN: online selects, target evaluates
+        q_next_online = self.model.predict(NS, verbose=0)
+        best_next_actions = np.argmax(q_next_online, axis=1)
+        q_next_target = self.target_model.predict(NS, verbose=0)
+        best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions]
+
+        # 1-step target: Rn + (gamma)*Q(next)*(1 - done)
+        Tgt = Rn + Disc * best_next_q * (1.0 - Dn)
+
+        # Current Q und TD-Error
+        q_curr = self.model.predict(S, verbose=0)
+        q_old = q_curr[np.arange(self.batch_size), A].copy()
+        td_errors = Tgt - q_old
+
+        # Train (use IS weights if available; for uniform they are ones)
+        q_curr[np.arange(self.batch_size), A] = Tgt
+        self.model.train_on_batch(S, q_curr, sample_weight=is_w)
+
+        # Update priorities (PER oder ReaPER)
+        if hasattr(self.memory, "update_priorities"):
+            self.memory.update_priorities(idxs, np.abs(td_errors))
+
+        # soft target update each training step
+        self._soft_update_target()
+        self.total_updates += 1
+
+
+# ---------- Average-Reward evaluation ----------------------------------------
+def evaluate_average_reward(agent, variant, data_dir, episodes=150, mode="validation"):
+    env = Environment(variant, data_dir)
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+    load_cap = getattr(env, "capacity", 1.0)
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    total = 0.0
+    for _ in range(episodes):
+        obs = env.reset(mode)
+        s = encode_obs(obs, H, W, max_steps, load_cap).reshape(1, -1)
+        done = 0; ep_ret = 0.0; steps = 0
+        while not done and steps < max_steps:
+            a = agent.select_action(s, training=False)  # strict greedy
+            r, nxt, done = env.step(a)
+            s = encode_obs(nxt, H, W, max_steps, load_cap).reshape(1, -1)
+            ep_ret += r; steps += 1
+        total += ep_ret
+    return total / float(episodes)
+
+
+def evaluate_mean_std(agent, variant, data_dir, episodes=150, seeds=(0, 1, 2)):
+    scores_val, scores_tst = [], []
+    for s in seeds:
+        np.random.seed(s); random.seed(s); tf.random.set_seed(s)
+        scores_val.append(
+            evaluate_average_reward(agent, variant, data_dir, episodes, mode="validation")
+        )
+        scores_tst.append(
+            evaluate_average_reward(agent, variant, data_dir, episodes, mode="testing")
+        )
+    val_mean, val_std = float(np.mean(scores_val)), float(np.std(scores_val))
+    tst_mean, tst_std = float(np.mean(scores_tst)), float(np.std(scores_tst))
+    return (val_mean, val_std), (tst_mean, tst_std)
+
+
+# ======= Helper: global seed ================================================
+def set_global_seed(seed: int):
+    import random as _random
+    import numpy as _np
+    import tensorflow as _tf
+    _random.seed(seed)
+    _np.random.seed(seed)
+    _tf.random.set_seed(seed)
+
+
+# ======= Main: PER vs ReaPER ================================================
+if __name__ == "__main__":
+    state_size = 77
+    no_of_actions = 5
+
+    DATA_DIR = "./data"
+    VARIANT = 0
+    TRAIN_EPISODES = 500
+    BASE_SEED = 1
+
+    # Gemeinsame Basis-Hyperparameter
+    base_hparams = {
+        'gamma': 0.9,
+        'epsilon': 1.0,
+        'batch_size': 32,
+        'epsilon_min': 0.10,
+        'epsilon_decay': 0.995,
+        'units': 64,
+        'tau': 0.01,   # soft target update
+    }
+
+    # --------- Agent 1: klassisches PER -------------------------------------
+    hparams_per = dict(base_hparams)
+    hparams_per.update({
+        'use_per': True,
+        'use_reaper': False,
+        'per_alpha': 0.6,
+        'per_beta0': 0.4,
+        'per_beta1': 1.0,
+        'per_eps': 1e-6,
+        'per_beta_anneal_steps': 50_000,
+    })
+
+    # --------- Agent 2: Reliability-adjusted PER (ReaPER) -------------------
+    hparams_reaper = dict(base_hparams)
+    hparams_reaper.update({
+        'use_per': False,
+        'use_reaper': True,
+        'reaper_alpha': 0.6,
+        'reaper_beta0': 0.4,
+        'reaper_beta1': 1.0,
+        'reaper_eps': 1e-6,
+        'reaper_beta_anneal_steps': 50_000,
+        'reaper_omega': 0.5,
+    })
+
+    # ---------- Agents erzeugen & gleiche Initialgewichte erzwingen ---------
+    # Erster Agent: ReaPER (liefert uns die Initialgewichte)
+    set_global_seed(BASE_SEED)
+    agent_reaper = DQN_Agent(state_size, no_of_actions, hparams_reaper)
+
+    # Zweiter Agent: PER
+    set_global_seed(BASE_SEED)
+    agent_per = DQN_Agent(state_size, no_of_actions, hparams_per)
+
+    # Gemeinsame Startgewichte (faire Ausgangslage)
+    init_weights = agent_reaper.model.get_weights()
+    agent_reaper.model.set_weights(init_weights)
+    agent_reaper.target_model.set_weights(init_weights)
+
+    agent_per.model.set_weights(init_weights)
+    agent_per.target_model.set_weights(init_weights)
+
+    # ---------- Ordner anlegen ----------------------------------------------
+    wd = os.getcwd()
+    save_folder = os.path.join(wd, 'save_folder')
+    os.makedirs(save_folder, exist_ok=True)
+
+    # ---------- Run 1: PER trainieren ---------------------------------------
+    print("\n===== TRAINING: PER (klassisches Prioritized Replay) =====")
+    set_global_seed(BASE_SEED)  # gleiche Start-Randomness fürs Environment
+    env_train_per = GymEnvironment(
+        'custom_env_per', save_folder,
+        render=False,
+        variant=VARIANT, data_dir=DATA_DIR,
+        pretty_render=False,
+        fps=8, render_every=2
+    )
+    rew_per = env_train_per.trainDQN(agent_per, TRAIN_EPISODES)
+
+    # ---------- Run 2: ReaPER trainieren ------------------------------------
+    print("\n===== TRAINING: ReaPER (Reliability-adjusted PER) =====")
+    set_global_seed(BASE_SEED)  # gleiche Start-Randomness wieder herstellen
+    env_train_reaper = GymEnvironment(
+        'custom_env_reaper', save_folder,
+        render=False,
+        variant=VARIANT, data_dir=DATA_DIR,
+        pretty_render=False,
+        fps=8, render_every=2
+    )
+    rew_reaper = env_train_reaper.trainDQN(agent_reaper, TRAIN_EPISODES)
+
+    # ---------- Vergleich: Plot PER vs ReaPER -------------------------------
+    plt.figure(figsize=(8, 4))
+
+    # Raw curves
+    plt.plot(rew_per,     alpha=0.3, linewidth=1.0, label="PER (raw)")
+    plt.plot(rew_reaper,  alpha=0.3, linewidth=1.0, label="ReaPER (raw)")
+
+    # Smoothed curves
+    window = min(20, max(5, TRAIN_EPISODES // 20))
+    xs_per,    ma_per    = moving_average(rew_per, window)
+    xs_rea,    ma_reaper = moving_average(rew_reaper, window)
+
+    if ma_per.size:
+        plt.plot(xs_per,   ma_per,    linewidth=2.0, label=f"PER MA({window})")
+    if ma_reaper.size:
+        plt.plot(xs_rea,   ma_reaper, linewidth=2.0, label=f"ReaPER MA({window})")
+
+    plt.title("Training reward per episode: PER vs ReaPER\n(Dueling Double DQN, 1-step)")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.ylim(*GLOBAL_YLIM)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ---------- Summary-Stats ausgeben --------------------------------------
+    print("\n# SUMMARY PER (last 50 episodes)")
+    summary_per = summarize_rewards(rew_per, tail=50)
+    for k, v in summary_per.items():
+        print(f"#   {k:>10}: {v}")
+
+    print("\n# SUMMARY ReaPER (last 50 episodes)")
+    summary_reaper = summarize_rewards(rew_reaper, tail=50)
+    for k, v in summary_reaper.items():
+        print(f"#   {k:>10}: {v}")
+
+    # Optional: Greedy-Evaluation für ReaPER
+    EVAL_EPISODES = 150
+    print("\n# agent ReaPER greedy evaluation: average reward")
+    (val_mean, val_std), (tst_mean, tst_std) = evaluate_mean_std(
+        agent_reaper, VARIANT, DATA_DIR, episodes=EVAL_EPISODES, seeds=(0, 1, 2)
+    )
+    print(f"#   - variant {VARIANT}: validation {val_mean:.3f} ± {val_std:.3f}, "
+          f"testing {tst_mean:.3f} ± {tst_std:.3f}")
