@@ -1,0 +1,594 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+import matplotlib.pyplot as plt
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+# ------------------------------------------------------------
+# 0.  IMPORT YOUR ENV
+# ------------------------------------------------------------
+from environment import Environment
+
+
+# ------------------------------------------------------------
+# 1.  DISTANCE STRUCTURES (like greedy, but inside SAC)
+# ------------------------------------------------------------
+
+def _build_distance_structs(env):
+    """
+    Precompute shortest path distances for this env.variant and attach them
+    to the env instance. We DO NOT change environment.py, we only add attributes
+    to the object at runtime.
+
+    We create:
+      env._dist_matrix          : shortest path distances between nodes (graph)
+      env._dist_from_idx_grids  : list of [5x5] grids, distances from each node
+      env._dist_base_grid       : [5x5] grid, distance from base (target_loc)
+      env._coord_to_idx         : mapping coord -> graph index (for variant 2)
+      env._mapping              : list of coords per graph index (for variant 2)
+    """
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return  # already built
+
+    variant = env.variant
+    H, W = 5, 5
+
+    if variant in (0, 1):
+        # 5x5 full grid, indices 0..24 as in greedy script
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_vert = i // 5
+                i_hori = i % 5
+                j_vert = j // 5
+                j_hori = j % 5
+                dist_vert = j_vert - i_vert
+                dist_hori = j_hori - i_hori
+                if (dist_vert == 0 and dist_hori == 1) or (dist_vert == 1 and dist_hori == 0):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1  # symmetric
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph,
+                                  directed=False,
+                                  return_predecessors=True,
+                                  unweighted=True)
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        # precompute distance grids (from each index -> 5x5 grid)
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        # base index
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+    else:
+        # variant 2: grid with holes and custom mapping as in greedy script
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3),
+            (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1)
+        link(1, 2)
+        link(2, 3)
+        link(3, 4)
+        link(3, 5)
+        link(4, 6)
+        link(5, 6)
+        link(5, 10)
+        link(6, 11)
+        link(7, 8)
+        link(7, 12)
+        link(8, 9)
+        link(9, 10)
+        link(10, 11)
+        link(12, 13)
+        link(13, 14)
+        link(14, 15)
+        link(15, 16)
+        link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph,
+                                  directed=False,
+                                  return_predecessors=True,
+                                  unweighted=True)
+
+        env._dist_matrix = dist_matrix
+
+        # precompute distance grids
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        # base index
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+    env._dist_ready = True
+
+
+def _coord_to_idx(env, coord):
+    """Convert (r,c) coord to graph index depending on variant."""
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    else:
+        return env._coord_to_idx[coord]
+
+
+# ------------------------------------------------------------
+# 2.  STATE ENCODING (Solution 1 + CNN-ready grid)
+# ------------------------------------------------------------
+
+# We will use 9 channels of size 5x5:
+#   0: agent position (one-hot)
+#   1: item presence
+#   2: item age (normalized)
+#   3: distance agent -> cell (normalized)
+#   4: distance base -> cell (normalized)
+#   5: urgency (time until expiry, normalized)
+#   6: eligible mask (1 if cell is eligible, 0 if hole)
+#   7: step_norm (same scalar everywhere)
+#   8: load_norm (same scalar everywhere)
+CHANNELS = 9
+HEIGHT = 5
+WIDTH = 5
+
+
+def encode_obs(obs, env):
+    """
+    obs = (step_count, agent_loc, agent_load, item_locs, item_times)
+
+    Output: flattened (C * H * W) array that encodes:
+      - agent position (channel 0)
+      - item presence (channel 1)
+      - item ages (channel 2)
+      - shortest path distance agent->cell (channel 3)
+      - shortest path distance base->cell (channel 4)
+      - urgency (time until expiry) (channel 5)
+      - eligible mask (channel 6)
+      - step (normalized) as global channel 7
+      - load (normalized) as global channel 8
+
+    NO changes to the environment are needed, we only attach extra
+    attributes on env instances for distance matrices.
+    """
+    step, agent_loc, agent_load, item_locs, item_times = obs
+
+    H, W = HEIGHT, WIDTH
+    state = np.zeros((CHANNELS, H, W), dtype=np.float32)
+
+    # ensure distance structures exist on this env instance
+    _build_distance_structs(env)
+
+    # 6: eligible mask
+    if env.variant in (0, 1):
+        # all cells are eligible
+        state[6, :, :] = 1.0
+    else:
+        eligible_set = set(env.eligible_cells)
+        for r in range(H):
+            for c in range(W):
+                if (r, c) in eligible_set:
+                    state[6, r, c] = 1.0
+                else:
+                    state[6, r, c] = 0.0
+
+    # 0: agent position
+    ar, ac = agent_loc
+    state[0, ar, ac] = 1.0
+
+    # 1,2,5: items: presence, age, urgency
+    for (loc, age) in zip(item_locs, item_times):
+        r, c = loc
+        state[1, r, c] = 1.0
+        state[2, r, c] = age / env.max_response_time  # age normalized
+        state[5, r, c] = (env.max_response_time - age) / env.max_response_time  # urgency
+
+    # 3: distance agent->cell (normalized)
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+    # normalize by max possible distance in this graph (avoid division by 0)
+    max_dist = np.max(env._dist_matrix[env._dist_matrix < np.inf])
+    if max_dist > 0:
+        state[3, :, :] = dist_agent_grid / max_dist
+    else:
+        state[3, :, :] = 0.0
+
+    # 4: distance base->cell (normalized)
+    dist_base_grid = env._dist_base_grid
+    if max_dist > 0:
+        state[4, :, :] = dist_base_grid / max_dist
+    else:
+        state[4, :, :] = 0.0
+
+    # 7: step norm (same everywhere)
+    state[7, :, :] = step / env.episode_steps
+
+    # 8: load norm (same everywhere)
+    state[8, :, :] = agent_load / env.agent_capacity
+
+    # Flatten to vector for ReplayBuffer; networks will reshape to [B,C,H,W]
+    return state.reshape(-1)  # shape = (CHANNELS * H * W,) = 9 * 5 * 5 = 225
+
+
+# ------------------------------------------------------------
+# 3.  CNN NETWORKS FOR DISCRETE SAC (Solution 2)
+# ------------------------------------------------------------
+
+class QNetwork(nn.Module):
+    def __init__(self, obs_dim, n_actions, hidden_dim=128):
+        super().__init__()
+        self.channels = CHANNELS
+        self.height = HEIGHT
+        self.width = WIDTH
+
+        assert obs_dim == self.channels * self.height * self.width, \
+            f"obs_dim {obs_dim} != {self.channels}*{self.height}*{self.width}"
+
+        # Convolutional feature extractor
+        self.conv1 = nn.Conv2d(self.channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+
+        conv_out_dim = 64 * self.height * self.width
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(conv_out_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, n_actions)
+
+    def forward(self, x):
+        # x shape: [B, obs_dim] -> reshape to [B, C, H, W]
+        x = x.view(-1, self.channels, self.height, self.width)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.out(x)  # [B, n_actions]
+
+
+class CategoricalPolicy(nn.Module):
+    def __init__(self, obs_dim, n_actions, hidden_dim=128):
+        super().__init__()
+        self.channels = CHANNELS
+        self.height = HEIGHT
+        self.width = WIDTH
+
+        assert obs_dim == self.channels * self.height * self.width, \
+            f"obs_dim {obs_dim} != {self.channels}*{self.height}*{self.width}"
+
+        self.conv1 = nn.Conv2d(self.channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+
+        conv_out_dim = 64 * self.height * self.width
+
+        self.fc1 = nn.Linear(conv_out_dim, hidden_dim)
+        self.logits_layer = nn.Linear(hidden_dim, n_actions)
+
+    def forward(self, x):
+        # x: [B, obs_dim]
+        x = x.view(-1, self.channels, self.height, self.width)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+
+        logits = self.logits_layer(x)
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        return probs, log_probs, logits
+
+
+# ------------------------------------------------------------
+# 4.  REPLAY BUFFER
+# ------------------------------------------------------------
+
+class ReplayBuffer:
+    def __init__(self, capacity, obs_dim):
+        self.capacity = capacity
+        self.obs_buf = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.obs_next_buf = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros((capacity,), dtype=np.int64)
+        self.rew_buf = np.zeros((capacity,), dtype=np.float32)
+        self.done_buf = np.zeros((capacity,), dtype=np.float32)
+        self.ptr = 0
+        self.size = 0
+
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs_buf[self.ptr] = obs
+        self.obs_next_buf[self.ptr] = next_obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample_batch(self, batch_size):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        return dict(
+            obs=self.obs_buf[idxs],
+            obs_next=self.obs_next_buf[idxs],
+            act=self.act_buf[idxs],
+            rew=self.rew_buf[idxs],
+            done=self.done_buf[idxs],
+        )
+
+
+# ------------------------------------------------------------
+# 5.  DISCRETE SAC AGENT (unchanged update logic)
+# ------------------------------------------------------------
+
+class DiscreteSACAgent:
+    def __init__(
+        self,
+        obs_dim,
+        n_actions,
+        gamma=0.99,
+        tau=0.005,
+        alpha=0.2,
+        lr=3e-4,
+        hidden_dim=128,
+        device="cpu",
+    ):
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+        self.device = torch.device(device)
+
+        self.q1 = QNetwork(obs_dim, n_actions, hidden_dim).to(self.device)
+        self.q2 = QNetwork(obs_dim, n_actions, hidden_dim).to(self.device)
+        self.q1_target = QNetwork(obs_dim, n_actions, hidden_dim).to(self.device)
+        self.q2_target = QNetwork(obs_dim, n_actions, hidden_dim).to(self.device)
+
+        self.policy = CategoricalPolicy(obs_dim, n_actions, hidden_dim).to(self.device)
+
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.q1_opt = Adam(self.q1.parameters(), lr=lr)
+        self.q2_opt = Adam(self.q2.parameters(), lr=lr)
+        self.policy_opt = Adam(self.policy.parameters(), lr=lr)
+
+    @torch.no_grad()
+    def act(self, obs_vec, eval_mode=False):
+        obs_t = torch.as_tensor(obs_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        probs, _, _ = self.policy(obs_t)
+        probs = probs[0]
+        if eval_mode:
+            a = probs.argmax().item()
+        else:
+            dist = torch.distributions.Categorical(probs=probs)
+            a = dist.sample().item()
+        return a
+
+    def update(self, replay_buffer, batch_size):
+        if replay_buffer.size < batch_size:
+            return
+
+        batch = replay_buffer.sample_batch(batch_size)
+
+        obs = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device)
+        obs_next = torch.as_tensor(batch["obs_next"], dtype=torch.float32, device=self.device)
+        act = torch.as_tensor(batch["act"], dtype=torch.long, device=self.device)
+        rew = torch.as_tensor(batch["rew"], dtype=torch.float32, device=self.device)
+        done = torch.as_tensor(batch["done"], dtype=torch.float32, device=self.device)
+
+        # ----- Critic -----
+        q1_values = self.q1(obs)
+        q2_values = self.q2(obs)
+        q1_s_a = q1_values.gather(1, act.unsqueeze(1)).squeeze(1)
+        q2_s_a = q2_values.gather(1, act.unsqueeze(1)).squeeze(1)
+
+        with torch.no_grad():
+            probs_next, logp_next, _ = self.policy(obs_next)
+            q1_next = self.q1_target(obs_next)
+            q2_next = self.q2_target(obs_next)
+            q_min_next = torch.min(q1_next, q2_next)
+
+            v_next = (probs_next * (q_min_next - self.alpha * logp_next)).sum(dim=1)
+            y = rew + self.gamma * (1 - done) * v_next
+
+        critic_loss1 = F.mse_loss(q1_s_a, y)
+        critic_loss2 = F.mse_loss(q2_s_a, y)
+        critic_loss = critic_loss1 + critic_loss2
+
+        self.q1_opt.zero_grad()
+        self.q2_opt.zero_grad()
+        critic_loss.backward()
+        self.q1_opt.step()
+        self.q2_opt.step()
+
+        # ----- Actor -----
+        probs, logp, _ = self.policy(obs)
+        q1_pi = self.q1(obs)
+        q2_pi = self.q2(obs)
+        q_min = torch.min(q1_pi, q2_pi).detach()
+
+        actor_loss = (probs * (self.alpha * logp - q_min)).sum(dim=1).mean()
+
+        self.policy_opt.zero_grad()
+        actor_loss.backward()
+        self.policy_opt.step()
+
+        # ----- Target soft update -----
+        with torch.no_grad():
+            for p, p_targ in zip(self.q1.parameters(), self.q1_target.parameters()):
+                p_targ.data.mul_(1.0 - self.tau)
+                p_targ.data.add_(self.tau * p.data)
+            for p, p_targ in zip(self.q2.parameters(), self.q2_target.parameters()):
+                p_targ.data.mul_(1.0 - self.tau)
+                p_targ.data.add_(self.tau * p.data)
+
+
+# ------------------------------------------------------------
+# 6.  TRAIN + TEST + PLOT
+# ------------------------------------------------------------
+
+def train_and_test_sac(
+    data_dir,
+    variant=0,
+    train_episodes=1000,
+    test_episodes=100,
+    replay_size=100000,
+    batch_size=64,
+    start_steps=1000,
+    update_after=1000,
+    update_every=1,
+    gamma=0.99,
+    tau=0.005,
+    alpha=0.2,
+    lr=3e-4,
+    device="cpu",
+    print_interval=25,
+):
+    env = Environment(variant=variant, data_dir=data_dir)
+    n_actions = 5
+
+    obs0 = env.reset(mode="training")
+    obs_vec0 = encode_obs(obs0, env)
+    obs_dim = obs_vec0.shape[0]
+
+    buffer = ReplayBuffer(replay_size, obs_dim)
+    agent = DiscreteSACAgent(
+        obs_dim=obs_dim,
+        n_actions=n_actions,
+        gamma=gamma,
+        tau=tau,
+        alpha=alpha,
+        lr=lr,
+        device=device,
+    )
+
+    total_steps = 0
+    train_returns = []
+
+    # -------- TRAINING --------
+    for ep in range(train_episodes):
+        obs = env.reset(mode="training")
+        obs_vec = encode_obs(obs, env)
+        done = False
+        ep_ret = 0.0
+
+        while not done:
+            if total_steps < start_steps:
+                act = np.random.randint(0, n_actions)
+            else:
+                act = agent.act(obs_vec, eval_mode=False)
+
+            rew, obs_next, done_flag = env.step(act)
+            obs_next_vec = encode_obs(obs_next, env)
+
+            buffer.store(obs_vec, act, rew, obs_next_vec, float(done_flag))
+
+            obs_vec = obs_next_vec
+            ep_ret += rew
+            done = bool(done_flag)
+            total_steps += 1
+
+            if total_steps >= update_after and total_steps % update_every == 0:
+                agent.update(buffer, batch_size)
+
+        train_returns.append(ep_ret)
+
+        if (ep + 1) % print_interval == 0:
+            avg25 = np.mean(train_returns[-print_interval:])
+            print(f"[TRAIN] Episode {ep+1}/{train_episodes}  "
+                  f"Return: {ep_ret:.1f}  Avg(last {print_interval}): {avg25:.1f}")
+
+    # -------- TESTING --------
+    test_returns = []
+    # avoid IndexError if there are fewer test_episodes in env
+    max_test_eps = min(test_episodes, len(env.test_episodes))
+    for ep in range(max_test_eps):
+        obs = env.reset(mode="testing")
+        obs_vec = encode_obs(obs, env)
+        done = False
+        ep_ret = 0.0
+
+        while not done:
+            act = agent.act(obs_vec, eval_mode=True)
+            rew, obs_next, done_flag = env.step(act)
+            obs_vec = encode_obs(obs_next, env)
+            ep_ret += rew
+            done = bool(done_flag)
+
+        test_returns.append(ep_ret)
+
+        if (ep + 1) % print_interval == 0:
+            avgN = np.mean(test_returns[-min(print_interval, ep+1):])
+            print(f"[TEST] Episode {ep+1}/{max_test_eps}  "
+                  f"Return: {ep_ret:.1f}  Avg(last {min(print_interval, ep+1)}): {avgN:.1f}")
+
+    # -------- PLOT --------
+    episodes = np.arange(1, train_episodes + 1)
+    plt.figure()
+    plt.plot(episodes, train_returns, label="Train return")
+
+    if train_episodes >= 25:
+        kernel = np.ones(print_interval) / print_interval
+        mov_avg = np.convolve(train_returns, kernel, mode="valid")
+        plt.plot(np.arange(print_interval, train_episodes + 1),
+                 mov_avg, label=f"{print_interval}-episode avg")
+
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title("Discrete SAC (CNN + distance features) – Training Returns")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return agent, train_returns, test_returns
+
+
+# ------------------------------------------------------------
+# 7.  MAIN ENTRY POINT
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+    DATA_DIR = "./data"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    agent, train_returns, test_returns = train_and_test_sac(
+        data_dir=DATA_DIR,
+        variant=0,
+        train_episodes=1000,
+        test_episodes=100,
+        device=device,
+    )
