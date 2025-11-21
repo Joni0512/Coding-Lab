@@ -1,0 +1,671 @@
+import os
+import random
+import argparse
+from copy import deepcopy
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Dense, Input, Conv2D, Flatten, Reshape
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+from environment import Environment
+
+
+# ============================================================
+#  Utilities
+# ============================================================
+
+def set_global_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    try:
+        tf.config.experimental.enable_op_determinism(True)
+    except Exception:
+        pass
+    tf.keras.backend.clear_session()
+
+
+# ============================================================
+#  Distance structures (same idea as greedy + SAC)
+# ============================================================
+
+# grid size is fixed by the environment
+HEIGHT = 5
+WIDTH = 5
+CHANNELS = 9   # see encode_obs below
+
+
+def _build_distance_structs(env: Environment):
+    """
+    Build shortest-path distance structures for this env.instance and
+    attach them as attributes.
+
+    We DO NOT modify environment.py.
+    """
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+
+    variant = env.variant
+
+    if variant in (0, 1):
+        # Full 5x5 grid
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_vert = i // 5
+                i_hori = i % 5
+                j_vert = j // 5
+                j_hori = j % 5
+                dv = j_vert - i_vert
+                dh = j_hori - i_hori
+                if (dv == 0 and dh == 1) or (dv == 1 and dh == 0):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(
+            csgraph=graph,
+            directed=False,
+            return_predecessors=True,
+            unweighted=True,
+        )
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        # precompute distance grids from each index
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        # base index (target location)
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+    else:
+        # Variant 2 with holes and mapping (same as greedy)
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3),
+            (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1)
+        link(1, 2)
+        link(2, 3)
+        link(3, 4)
+        link(3, 5)
+        link(4, 6)
+        link(5, 6)
+        link(5, 10)
+        link(6, 11)
+        link(7, 8)
+        link(7, 12)
+        link(8, 9)
+        link(9, 10)
+        link(10, 11)
+        link(12, 13)
+        link(13, 14)
+        link(14, 15)
+        link(15, 16)
+        link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(
+            csgraph=graph,
+            directed=False,
+            return_predecessors=True,
+            unweighted=True,
+        )
+
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+    env._dist_ready = True
+
+
+def _coord_to_idx(env: Environment, coord):
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    else:
+        return env._coord_to_idx[coord]
+
+
+def encode_obs(obs, env: Environment):
+    """
+    obs = (step_count, agent_loc, agent_load, item_locs, item_times)
+
+    We encode to a 9x5x5 "image":
+
+      0: agent position (one-hot)
+      1: item presence
+      2: item age (normalized)
+      3: distance agent -> cell (normalized)
+      4: distance base  -> cell (normalized)
+      5: urgency (time until expiry, normalized)
+      6: eligible mask (1 if cell is valid)
+      7: step_norm (same everywhere)
+      8: load_norm (same everywhere)
+
+    Returned as a flat vector of length CHANNELS*HEIGHT*WIDTH.
+    """
+    step, agent_loc, agent_load, item_locs, item_times = obs
+
+    _build_distance_structs(env)
+
+    state = np.zeros((CHANNELS, HEIGHT, WIDTH), dtype=np.float32)
+
+    # channel 6: eligible mask
+    if env.variant in (0, 1):
+        state[6, :, :] = 1.0
+    else:
+        eligible_set = set(env.eligible_cells)
+        for r in range(HEIGHT):
+            for c in range(WIDTH):
+                state[6, r, c] = 1.0 if (r, c) in eligible_set else 0.0
+
+    # channel 0: agent position
+    ar, ac = agent_loc
+    state[0, ar, ac] = 1.0
+
+    # channels 1,2,5: items
+    for (loc, age) in zip(item_locs, item_times):
+        r, c = loc
+        state[1, r, c] = 1.0
+        state[2, r, c] = age / env.max_response_time
+        state[5, r, c] = (env.max_response_time - age) / env.max_response_time
+
+    # channel 3: distance agent -> cell
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+    max_dist = np.max(env._dist_matrix[env._dist_matrix < np.inf])
+    if max_dist > 0:
+        state[3, :, :] = dist_agent_grid / max_dist
+
+    # channel 4: distance base -> cell
+    dist_base_grid = env._dist_base_grid
+    if max_dist > 0:
+        state[4, :, :] = dist_base_grid / max_dist
+
+    # channel 7: step norm
+    state[7, :, :] = step / env.episode_steps
+
+    # channel 8: load norm
+    state[8, :, :] = agent_load / env.agent_capacity
+
+    return state.reshape(-1)  # length = 9*5*5 = 225
+
+
+def get_initial_obs(env, mode: str):
+    env.reset(mode)
+    obs = env.get_obs()
+    enc = encode_obs(obs, env)
+    return np.asarray(enc, dtype=np.float32)
+
+
+# ============================================================
+#  PPO Agent (CNN + distance features)
+# ============================================================
+
+class PPOAgent:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        gamma: float = 0.99,
+        lam: float = 0.95,
+        clip_ratio: float = 0.2,
+        actor_lr: float = 3e-4,
+        critic_lr: float = 1e-3,
+        entropy_coefficient: float = 0.01,
+        train_policy_epochs: int = 10,
+        train_value_epochs: int = 10,
+        minibatch_size: int = 256,
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.lam = lam
+        self.clip_ratio = clip_ratio
+        self.entropy_coefficient = entropy_coefficient
+        self.train_policy_epochs = train_policy_epochs
+        self.train_value_epochs = train_value_epochs
+        self.minibatch_size = minibatch_size
+
+        # On-policy buffer
+        self.buffer = {
+            "states": [],
+            "actions": [],
+            "rewards": [],
+            "dones": [],
+            "logits": [],
+            "values": [],
+        }
+
+        # Networks (CNN over 9x5x5 grid)
+        self.actor = self._build_cnn_actor()
+        self.critic = self._build_cnn_critic()
+
+        # Optimizers
+        self.policy_optimizer = tf.keras.optimizers.Adam(learning_rate=actor_lr)
+        self.value_optimizer = tf.keras.optimizers.Adam(learning_rate=critic_lr)
+
+    def _build_cnn_actor(self) -> Model:
+        x_in = Input(shape=(self.state_dim,), dtype=tf.float32)
+        # reshape to [H,W,C]
+        x = Reshape((HEIGHT, WIDTH, CHANNELS))(x_in)
+        x = Conv2D(32, kernel_size=3, padding="same", activation="relu")(x)
+        x = Conv2D(64, kernel_size=3, padding="same", activation="relu")(x)
+        x = Flatten()(x)
+        x = Dense(128, activation="relu")(x)
+        out = Dense(self.action_dim, activation=None)(x)
+        return Model(inputs=x_in, outputs=out)
+
+    def _build_cnn_critic(self) -> Model:
+        x_in = Input(shape=(self.state_dim,), dtype=tf.float32)
+        x = Reshape((HEIGHT, WIDTH, CHANNELS))(x_in)
+        x = Conv2D(32, kernel_size=3, padding="same", activation="relu")(x)
+        x = Conv2D(64, kernel_size=3, padding="same", activation="relu")(x)
+        x = Flatten()(x)
+        x = Dense(128, activation="relu")(x)
+        out = Dense(1, activation="linear")(x)
+        return Model(inputs=x_in, outputs=out)
+
+    def _log_probs(self, logits, actions):
+        log_probs_all = tf.nn.log_softmax(logits, axis=1)  # [B, A]
+        actions_one_hot = tf.one_hot(actions, self.action_dim)  # [B, A]
+        return tf.reduce_sum(actions_one_hot * log_probs_all, axis=1)  # [B]
+
+    def select_action(self, state, deterministic: bool = False):
+        s = np.asarray(state, dtype=np.float32).reshape(1, -1)
+        logits = self.actor(s)
+        probs = tf.nn.softmax(logits, axis=1)
+
+        if deterministic:
+            action = tf.argmax(probs, axis=1)
+        else:
+            action = tf.random.categorical(tf.math.log(probs), num_samples=1)
+
+        return logits.numpy().squeeze(0), int(action.numpy().squeeze())
+
+    def record(self, state, action, reward, done, logits, value):
+        self.buffer["states"].append(np.asarray(state, dtype=np.float32))
+        self.buffer["actions"].append(int(action))
+        self.buffer["rewards"].append(float(reward))
+        self.buffer["dones"].append(bool(done))
+        self.buffer["logits"].append(np.asarray(logits, dtype=np.float32))
+        self.buffer["values"].append(float(value))
+
+    def compute_advantages(self, last_value=0.0, last_done=True):
+        rewards = np.array(self.buffer["rewards"], dtype=np.float32)
+        values = np.array(self.buffer["values"], dtype=np.float32)
+        dones = np.array(self.buffer["dones"], dtype=np.float32)
+
+        T = len(rewards)
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        gae = 0.0
+
+        next_value = last_value
+        next_not_done = 0.0 if last_done else 1.0
+
+        for t in reversed(range(T)):
+            if t == T - 1:
+                v_tp1 = next_value
+                not_done = next_not_done
+            else:
+                v_tp1 = values[t + 1]
+                not_done = 1.0 - dones[t]
+
+            delta = rewards[t] + self.gamma * v_tp1 * not_done - values[t]
+            gae = delta + self.gamma * self.lam * not_done * gae
+            advantages[t] = gae
+
+        self.buffer["advantages"] = advantages
+        self.buffer["returns"] = advantages + values
+
+    def update_policy(self):
+        buf = {
+            k: np.array(v) for k, v in self.buffer.items()
+            if k in ["states", "actions", "logits", "advantages", "returns"]
+        }
+
+        adv = buf["advantages"]
+        buf["advantages"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        N = buf["states"].shape[0]
+        idxs = np.arange(N)
+
+        for _ in range(self.train_policy_epochs):
+            np.random.shuffle(idxs)
+            for start in range(0, N, self.minibatch_size):
+                mb = idxs[start:start + self.minibatch_size]
+
+                with tf.GradientTape() as tape:
+                    new_logits = self.actor(buf["states"][mb])
+                    old_logp = self._log_probs(buf["logits"][mb], buf["actions"][mb])
+                    new_logp = self._log_probs(new_logits, buf["actions"][mb])
+
+                    ratio = tf.exp(new_logp - old_logp)
+
+                    unclipped = ratio * buf["advantages"][mb]
+                    clipped = tf.clip_by_value(
+                        ratio,
+                        1.0 - self.clip_ratio,
+                        1.0 + self.clip_ratio,
+                    ) * buf["advantages"][mb]
+
+                    probs = tf.nn.softmax(new_logits, axis=1)
+                    log_probs = tf.nn.log_softmax(new_logits, axis=1)
+                    entropy = -tf.reduce_mean(
+                        tf.reduce_sum(probs * log_probs, axis=1)
+                    )
+
+                    policy_loss = -tf.reduce_mean(tf.minimum(unclipped, clipped))
+                    loss = policy_loss - self.entropy_coefficient * entropy
+
+                grads = tape.gradient(loss, self.actor.trainable_variables)
+                self.policy_optimizer.apply_gradients(
+                    zip(grads, self.actor.trainable_variables)
+                )
+
+    def update_value_function(self):
+        states = np.array(self.buffer["states"], dtype=np.float32)
+        returns = np.array(self.buffer["returns"], dtype=np.float32)
+
+        N = states.shape[0]
+        idxs = np.arange(N)
+
+        for _ in range(self.train_value_epochs):
+            np.random.shuffle(idxs)
+            for start in range(0, N, self.minibatch_size):
+                mb = idxs[start:start + self.minibatch_size]
+
+                with tf.GradientTape() as tape:
+                    values = tf.squeeze(self.critic(states[mb]), axis=1)
+                    loss = tf.reduce_mean((returns[mb] - values) ** 2)
+
+                grads = tape.gradient(loss, self.critic.trainable_variables)
+                self.value_optimizer.apply_gradients(
+                    zip(grads, self.critic.trainable_variables)
+                )
+
+    def clear_buffer(self):
+        self.buffer = {k: [] for k in self.buffer.keys()}
+
+
+# ============================================================
+#  Training & Evaluation
+# ============================================================
+
+def run_ppo_training(
+    env: Environment,
+    agent: PPOAgent,
+    train_episodes: int = 1000,
+    max_steps_per_episode: int = 200,
+    update_after_episodes: int = 1,
+):
+    episode_rewards = []
+
+    for ep in range(train_episodes):
+        env.reset("training")
+        obs = env.get_obs()
+        state = encode_obs(obs, env)
+
+        ep_reward = 0.0
+        done = False
+        t = 0
+
+        while not done and t < max_steps_per_episode:
+            logits, action = agent.select_action(state, deterministic=False)
+            value = float(agent.critic(state.reshape(1, -1)))
+
+            reward, next_obs, done = env.step(action)
+            next_state = encode_obs(next_obs, env)
+
+            agent.record(state, action, reward, done, logits, value)
+
+            state = next_state
+            ep_reward += reward
+            t += 1
+
+        if done:
+            last_value = 0.0
+            last_done = True
+        else:
+            last_value = float(agent.critic(state.reshape(1, -1)))
+            last_done = False
+
+        agent.compute_advantages(last_value=last_value, last_done=last_done)
+
+        if (ep + 1) % update_after_episodes == 0:
+            agent.update_policy()
+            agent.update_value_function()
+            agent.clear_buffer()
+
+        episode_rewards.append(ep_reward)
+
+        if (ep + 1) % 10 == 0:
+            avg_10 = np.mean(episode_rewards[-10:])
+            avg_100 = np.mean(episode_rewards[-100:])
+            print(
+                f"Episode {ep + 1}/{train_episodes} | "
+                f"Return: {ep_reward:.1f} | Avg(10): {avg_10:.1f} | "
+                f"Avg(100): {avg_100:.1f}"
+            )
+
+    return episode_rewards
+
+
+def evaluate_policy(
+    env: Environment,
+    agent: PPOAgent,
+    n_episodes: int = 100,
+    mode: str = "validation",
+    max_steps_per_episode: int = 200,
+):
+    rewards = []
+
+    for _ in range(n_episodes):
+        env.reset(mode)
+        obs = env.get_obs()
+        state = encode_obs(obs, env)
+
+        done = False
+        ep_reward = 0.0
+        t = 0
+
+        while not done and t < max_steps_per_episode:
+            _, action = agent.select_action(state, deterministic=True)
+            reward, next_obs, done = env.step(action)
+            state = encode_obs(next_obs, env)
+            ep_reward += reward
+            t += 1
+
+        rewards.append(ep_reward)
+
+    avg_reward = float(np.mean(rewards))
+    print(f"[{mode}] Average reward over {n_episodes} episodes: {avg_reward:.3f}")
+    return avg_reward, rewards
+
+
+def summarize_training(train_rewards):
+    rewards = np.asarray(train_rewards, dtype=np.float32)
+    n = len(rewards)
+    if n == 0:
+        print("\n=== Training statistics ===")
+        print("No episodes recorded.")
+        print("================================\n")
+        return
+
+    best_return = float(rewards.max())
+    best_ep = int(rewards.argmax()) + 1
+    mean_all = float(rewards.mean())
+    std_all = float(rewards.std())
+    window = min(100, n)
+    mean_last = float(rewards[-window:].mean())
+
+    print("\n=== Training statistics ===")
+    print(f"Episodes total:              {n}")
+    print(f"Best episode:                {best_ep}  (return = {best_return:.2f})")
+    print(f"Mean return (all):           {mean_all:.2f} ± {std_all:.2f}")
+    print(f"Mean return (last {window}): {mean_last:.2f}")
+    print("================================\n")
+
+
+# ============================================================
+#  Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="./data",
+        help="Relative path to data directory (e.g. './data')",
+    )
+    parser.add_argument(
+        "--variant",
+        type=int,
+        default=0,
+        help="Problem variant: 0 (base), 1 (ext 1), 2 (ext 2)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed",
+    )
+    parser.add_argument(
+        "--train_episodes",
+        type=int,
+        default=500,
+        help="Number of training episodes",
+    )
+    parser.add_argument(
+        "--val_episodes",
+        type=int,
+        default=100,
+        help="Number of validation episodes for evaluation",
+    )
+    args = parser.parse_args()
+
+    # Seed
+    seed = args.seed
+    set_global_seed(seed)
+
+    # Environment
+    data_dir = args.data_dir
+    variant = args.variant
+    env = Environment(variant, data_dir)
+
+    # State/action dimensions (using encoded obs)
+    init_obs = get_initial_obs(env, mode="training")
+    state_dim = int(np.asarray(init_obs, dtype=np.float32).shape[0])
+    action_dim = 5  # 0: idle, 1: up, 2: right, 3: down, 4: left
+
+    print(f"Initialized environment with variant={variant}")
+    print(f"Inferred state_dim={state_dim}, action_dim={action_dim}")
+
+    # Agent
+    agent = PPOAgent(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        gamma=0.99,
+        lam=0.95,
+        clip_ratio=0.2,
+        actor_lr=3e-4,
+        critic_lr=1e-3,
+        entropy_coefficient=0.01,
+        train_policy_epochs=10,
+        train_value_epochs=10,
+        minibatch_size=256,
+    )
+
+    # Training
+    max_steps_per_episode = 200
+    train_rewards = run_ppo_training(
+        env,
+        agent,
+        train_episodes=args.train_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        update_after_episodes=1,
+    )
+
+    summarize_training(train_rewards)
+
+    # Plot training curve
+    plt.figure(figsize=(8, 4))
+    plt.plot(train_rewards, label="Episode return", alpha=0.5)
+
+    if len(train_rewards) >= 10:
+        window = max(10, len(train_rewards) // 20)
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        smoothed = np.convolve(train_rewards, kernel, mode="valid")
+        x = np.arange(window - 1, window - 1 + len(smoothed))
+        plt.plot(x, smoothed, label=f"Moving avg (window={window})", linewidth=2)
+
+    plt.title(f"PPO training reward per episode (variant {variant})")
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    os.makedirs("save_folder", exist_ok=True)
+    fig_path = os.path.join(
+        "save_folder",
+        f"ppo_train_curve_variant{variant}_seed{seed}.png",
+    )
+    plt.savefig(fig_path, dpi=150)
+    print(f"Saved training curve to: {fig_path}")
+
+    plt.show()
+
+    # Validation evaluation
+    evaluate_policy(
+        env,
+        agent,
+        n_episodes=args.val_episodes,
+        mode="validation",
+        max_steps_per_episode=max_steps_per_episode,
+    )
+
+
+if __name__ == "__main__":
+    main()
