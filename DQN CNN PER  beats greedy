@@ -1163,19 +1163,8 @@ if __name__ == "__main__":
         variant_name="n1_noisy1_dist0",
     )
 
-    # ---- Deine 3 BO-Kombinationen (Overrides) ----
-    HP_COMBOS = {
-        "Combo 1": dict(
-            gamma=0.9365508123780244,
-            epsilon_decay=0.991006122268284,
-            epsilon_min=0.09998407967586492,
-            batch_size=50,
-            units=103,
-            per_alpha=0.508275177212186,
-            per_beta0=0.25408726936218085,
-            tau=0.0035793395740355343,
-            noisy_sigma0=0.2347073804653149,
-        ),
+    # ---- Deine beste BO-Kombination (Overrides) ----
+    HP_COMBO= = {
         "Combo 2": dict(
             gamma=0.9389065584049,
             epsilon_decay=0.99,
@@ -1186,17 +1175,6 @@ if __name__ == "__main__":
             per_beta0=0.2,
             tau=0.0010323839507959762,
             noisy_sigma0=0.12546649741233012,
-        ),
-        "Combo 3": dict(
-            gamma=0.9241197909259216,
-            epsilon_decay=0.99,
-            epsilon_min=0.01,
-            batch_size=128,
-            units=32,
-            per_alpha=0.7603318832710682,
-            per_beta0=0.6,
-            tau=0.01,
-            noisy_sigma0=1.0,
         ),
     }
 
