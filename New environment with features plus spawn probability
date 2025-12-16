@@ -1,0 +1,263 @@
+# actions: 0 (nothing), 1 (up), 2 (right), 3 (down), 4 (left)
+# grid coords: (0,0) is top-left; (row, col) increases down/right
+# note: if an item appears on the same step you arrive/stay, it cannot be picked that step
+
+import os
+import random
+import pandas as pd
+import numpy as np
+from copy import deepcopy
+from itertools import compress
+
+
+class Environment(object):
+    def __init__(self, variant, data_dir):
+        self.variant = variant
+        self.vertical_cell_count = 5
+        self.horizontal_cell_count = 5
+        self.vertical_idx_target = 2
+        self.horizontal_idx_target = 0
+        self.target_loc = (self.vertical_idx_target, self.horizontal_idx_target)
+        self.episode_steps = 200
+        self.max_response_time = 15 if self.variant == 2 else 10
+        self.reward = 25 if self.variant == 2 else 15
+
+        # Make data_dir absolute relative to this file if needed
+        if not os.path.isabs(data_dir):
+            data_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), data_dir))
+        self.data_dir = data_dir
+
+        # -------- variant-aware base path --------
+        self._base = os.path.join(self.data_dir, f'variant_{self.variant}')
+
+        # Episode id lists
+        self.training_episodes = pd.read_csv(
+            os.path.join(self._base, 'training_episodes.csv')
+        ).training_episodes.tolist()
+        self.validation_episodes = pd.read_csv(
+            os.path.join(self._base, 'validation_episodes.csv')
+        ).validation_episodes.tolist()
+        self.test_episodes = pd.read_csv(
+            os.path.join(self._base, 'test_episodes.csv')
+        ).test_episodes.tolist()
+
+        self.remaining_training_episodes = deepcopy(self.training_episodes)
+        self.validation_episode_counter = 0
+
+        # Capacity
+        self.agent_capacity = 1 if self.variant in (0, 2) else 3
+
+        # Eligible cells (holes in variant 2)
+        if self.variant in (0, 1):
+            self.eligible_cells = [(r, c) for r in range(5) for c in range(5)]
+        else:
+            self.eligible_cells = [
+                (0, 0),        (0, 2), (0, 3), (0, 4),
+                (1, 0),        (1, 2),         (1, 4),
+                (2, 0),        (2, 2),         (2, 4),
+                (3, 0), (3, 1), (3, 2),        (3, 4),
+                (4, 0), (4, 1), (4, 2),        (4, 4)
+            ]
+
+        # -------- discover available episode files & offset --------
+        ep_dir = os.path.join(self._base, 'episode_data')
+        files = [f for f in os.listdir(ep_dir) if f.startswith('episode_') and f.endswith('.csv')]
+        if not files:
+            raise FileNotFoundError(f"No episode files found in {ep_dir}")
+
+        def _parse_num(fname: str) -> int:
+            # supports episode_000.csv and episode_100.csv etc.
+            core = fname[len('episode_'):-4]
+            # tolerate leading zeros
+            return int(core)
+
+        self._available_ids = sorted(_parse_num(f) for f in files)
+        self._available_set = set(self._available_ids)
+        self._ep_min = min(self._available_ids)  # e.g., 0 or 100
+
+        # ============================================================
+        # STATIC / DATA-BASED MAPS (Heatmaps)
+        #   - eligible_mask_grid : 1 wenn begehbar, 0 sonst
+        #   - spawn_count_grid   : wie oft Items dort spawnen
+        #   - spawn_prob_grid    : normierte Wahrscheinlichkeiten
+        # ============================================================
+        H = self.vertical_cell_count
+        W = self.horizontal_cell_count
+
+        # 1) Eligible mask als 5x5-Heatmap
+        self.eligible_mask_grid = np.zeros((H, W), dtype=np.float32)
+        for (r, c) in self.eligible_cells:
+            self.eligible_mask_grid[r, c] = 1.0
+
+        # 2) Spawn-Statistiken initialisieren
+        self.spawn_count_grid = np.zeros((H, W), dtype=np.float32)
+        self.spawn_prob_grid = np.zeros((H, W), dtype=np.float32)
+
+        self._compute_spawn_statistics(ep_dir)
+
+    # ------------------------------------------------------------
+    # compute item spawn heatmaps across all episode_*.csv files
+    # ------------------------------------------------------------
+    def _compute_spawn_statistics(self, ep_dir):
+        """
+        Geht alle verfügbaren Episode-Dateien durch und zählt,
+        wie oft Items in jeder Zelle spawnen.
+        Ergebnisse:
+            - self.spawn_count_grid[r, c]: rohe Counts
+            - self.spawn_prob_grid[r, c]: normierte Wahrscheinlichkeiten
+        Es werden nur Zellen gezählt, die in eligible_cells liegen.
+        """
+        H = self.vertical_cell_count
+        W = self.horizontal_cell_count
+        count_grid = np.zeros((H, W), dtype=np.float32)
+
+        for file_id in self._available_ids:
+            # support both 'episode_7.csv' and 'episode_007.csv'
+            cand1 = os.path.join(ep_dir, f'episode_{file_id}.csv')
+            cand2 = os.path.join(ep_dir, f'episode_{file_id:03d}.csv')
+            if os.path.exists(cand1):
+                path = cand1
+            elif os.path.exists(cand2):
+                path = cand2
+            else:
+                # sollte nicht passieren, falls _available_ids konsistent ist
+                continue
+
+            df = pd.read_csv(path, index_col=0)
+
+            # wir gehen davon aus, dass diese Spalten die Spawn-Positionen enthalten
+            if not {'vertical_idx', 'horizontal_idx'}.issubset(df.columns):
+                continue
+
+            for r, c in zip(df.vertical_idx.values, df.horizontal_idx.values):
+                if 0 <= r < H and 0 <= c < W and (r, c) in self.eligible_cells:
+                    count_grid[r, c] += 1.0
+
+        self.spawn_count_grid = count_grid
+        total = float(count_grid.sum())
+        if total > 0.0:
+            self.spawn_prob_grid = count_grid / total
+        else:
+            # falls keine Spawns gefunden (sollte praktisch nicht vorkommen)
+            self.spawn_prob_grid = count_grid.copy()
+
+    # ------------------------------------------------------------
+    # initialize a new episode
+    # ------------------------------------------------------------
+    def reset(self, mode):
+        modes = ['training', 'validation', 'testing']
+        if mode not in modes:
+            raise ValueError('Invalid mode. Expected one of: %s' % modes)
+
+        self.step_count = 0
+        self.agent_loc = (self.vertical_idx_target, self.horizontal_idx_target)
+        self.agent_load = 0
+        self.item_locs = []
+        self.item_times = []
+
+        # choose episode id from the lists
+        if mode == "testing":
+            episode = self.test_episodes[0]
+            self.test_episodes.remove(episode)
+        elif mode == "validation":
+            episode = self.validation_episodes[self.validation_episode_counter]
+            self.validation_episode_counter = (self.validation_episode_counter + 1) % max(
+                1, len(self.validation_episodes)
+            )
+        else:  # training
+            if not self.remaining_training_episodes:
+                self.remaining_training_episodes = deepcopy(self.training_episodes)
+            episode = random.choice(self.remaining_training_episodes)
+            self.remaining_training_episodes.remove(episode)
+
+        # Map the list episode id to an actual filename id:
+        # - if the id exists directly, use it
+        # - else, add the discovered offset (min available id)
+        file_id = episode if episode in self._available_set else episode + self._ep_min
+
+        # Build a path that works with/without zero padding
+        ep_dir = os.path.join(self._base, 'episode_data')
+        cand1 = os.path.join(ep_dir, f'episode_{file_id}.csv')
+        cand2 = os.path.join(ep_dir, f'episode_{file_id:03d}.csv')
+        if os.path.exists(cand1):
+            ep_path = cand1
+        elif os.path.exists(cand2):
+            ep_path = cand2
+        else:
+            raise FileNotFoundError(
+                f"Episode file not found for id {file_id}. Tried:\n  {cand1}\n  {cand2}\n"
+                f"Available ids (min..max): {self._available_ids[0]}..{self._available_ids[-1]}"
+            )
+
+        # Load the per-step data
+        self.data = pd.read_csv(ep_path, index_col=0)
+
+        return self.get_obs()
+
+    # ------------------------------------------------------------
+    # take one environment step
+    # ------------------------------------------------------------
+    def step(self, act):
+        self.step_count += 1
+        rew = 0
+
+        # episode done?
+        done = 1 if self.step_count == self.episode_steps else 0
+
+        # agent movement (only valid moves cost -1 and change position)
+        if act != 0:
+            if act == 1:      # up
+                new_loc = (self.agent_loc[0] - 1, self.agent_loc[1])
+            elif act == 2:    # right
+                new_loc = (self.agent_loc[0], self.agent_loc[1] + 1)
+            elif act == 3:    # down
+                new_loc = (self.agent_loc[0] + 1, self.agent_loc[1])
+            elif act == 4:    # left
+                new_loc = (self.agent_loc[0], self.agent_loc[1] - 1)
+            else:
+                new_loc = self.agent_loc  # unknown action -> no-op
+
+            if new_loc in self.eligible_cells:
+                self.agent_loc = new_loc
+                rew += -1  # movement cost on valid move
+
+        # item pick-up
+        if (self.agent_load < self.agent_capacity) and (self.agent_loc in self.item_locs):
+            self.agent_load += 1
+            idx = self.item_locs.index(self.agent_loc)
+            self.item_locs.pop(idx)
+            self.item_times.pop(idx)
+            rew += self.reward / 2
+
+        # item drop-off at target
+        if self.agent_loc == self.target_loc and self.agent_load > 0:
+            rew += self.agent_load * self.reward / 2
+            self.agent_load = 0
+
+        # advance item ages and remove expired
+        self.item_times = [t + 1 for t in self.item_times]
+        mask = [t < self.max_response_time for t in self.item_times]
+        self.item_locs = list(compress(self.item_locs, mask))
+        self.item_times = list(compress(self.item_times, mask))
+
+        # add items that appear this step (cannot stack two items in same cell)
+        new_items_df = self.data[self.data.step == self.step_count]
+        new_items = list(zip(new_items_df.vertical_idx, new_items_df.horizontal_idx))
+        new_items = [loc for loc in new_items if loc not in self.item_locs]
+        self.item_locs += new_items
+        self.item_times += [0] * len(new_items)
+
+        next_obs = self.get_obs()
+        return rew, next_obs, done
+
+    # ------------------------------------------------------------
+    # minimal observation (der Rest steckt in Attributen wie Heatmaps)
+    # ------------------------------------------------------------
+    def get_obs(self):
+        return (
+            self.step_count,
+            self.agent_loc,
+            self.agent_load,
+            tuple(self.item_locs),
+            tuple(self.item_times),
+        )
