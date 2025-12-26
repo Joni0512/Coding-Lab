@@ -1,21 +1,15 @@
-# ============================================================
-# COMPLETE DQN SCRIPT (NO BO) — Variant focus + Priority Ratio feature
-# Compatible with your NEW environment.py (eligible_mask_grid, spawn_count_grid, spawn_prob_grid)
-#
+
 # - Noisy Dueling Double DQN + CNN
 # - PER (Prioritized Replay) with fixed SumTree indexing
 # - Action masking
 # - Train 800 / Val 100 / Test 100
 # - Plot training curve + Val/Test averages + (optional) greedy benchmark line
-#
 # NEW FEATURE (added on top of your 11 channels):
 #   Channel 11: priority_ratio_norm (on item cells)
 #     pr = ( 1/(1+d_agent) + 1/(1+d_target) ) * (1/t_i)
 #     t_i = remaining lifetime = max_response_time - age, clipped >= 1
 #     pr_norm = clip(pr/2, 0..1)
-#
-# Uses your old BO-best "Combo 2" parameters (hardcoded below).
-# ============================================================
+
 
 # ------------- Reproducibility / Quiet logs -----------------
 seed = 2
