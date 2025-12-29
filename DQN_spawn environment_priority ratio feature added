@@ -1,4 +1,3 @@
-
 # - Noisy Dueling Double DQN + CNN
 # - PER (Prioritized Replay) with fixed SumTree indexing
 # - Action masking
@@ -9,10 +8,18 @@
 #     pr = ( 1/(1+d_agent) + 1/(1+d_target) ) * (1/t_i)
 #     t_i = remaining lifetime = max_response_time - age, clipped >= 1
 #     pr_norm = clip(pr/2, 0..1)
+#
+# PERFORMANCE/RAM PATCHES INCLUDED:
+# - Soft target update in-place (no temp arrays; fixes ArrayMemoryError spikes)
+# - Valid-action mask vectorized (faster)
+# - Distance max_dist cached once in env (faster)
+# - Less reshape/copy in run loops
+# - ReplayBuffer dones stored as uint8 (less RAM)
+# - predict_on_batch used instead of .numpy() roundtrips (often faster/stabler)
 
 
 # ------------- Reproducibility / Quiet logs -----------------
-seed = 2
+seed = 165
 import os
 os.environ["PYTHONHASHSEED"] = str(seed)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"   # silence TF INFO/WARN
@@ -41,8 +48,8 @@ from environment import Environment  # must provide eligible_mask_grid, spawn_co
 from tensorflow.keras import Model, Input
 from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import Huber
 
+from tensorflow.keras.losses import Huber
 from collections import deque
 import warnings
 
@@ -71,6 +78,7 @@ def _build_distance_structs(env):
       env._dist_base_grid
       env._dist_ready
       env._mapping / env._coord_to_idx (variant 2)
+      env._max_dist (cached normalization factor)
     """
     if getattr(env, "_dist_ready", False):
         return
@@ -126,7 +134,7 @@ def _build_distance_structs(env):
             neighbor_matrix[i, j] = 1
             neighbor_matrix[j, i] = 1
 
-        # edges (from your earlier code)
+        # edges
         link(0, 1); link(1, 2); link(2, 3); link(3, 4)
         link(3, 5); link(4, 6); link(5, 6)
         link(5, 10); link(6, 11)
@@ -148,6 +156,12 @@ def _build_distance_structs(env):
         base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
         idx_base = env._coord_to_idx[base_coord]
         env._dist_base_grid = dist_grids[idx_base]
+
+    # Cache max_dist once (avoid recomputing each encode_obs call)
+    finite = env._dist_matrix[np.isfinite(env._dist_matrix)]
+    env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+    if env._max_dist <= 0.0:
+        env._max_dist = 1.0
 
     env._dist_ready = True
 
@@ -188,27 +202,24 @@ def encode_obs(obs, env):
 
     state = np.zeros((HEIGHT, WIDTH, CHANNELS), dtype=np.float32)
 
-    # 6: eligible mask (directly from env)
-    state[:, :, 6] = env.eligible_mask_grid.astype(np.float32)
+    # 6: eligible mask (assignment casts without allocating a copy)
+    state[:, :, 6] = env.eligible_mask_grid
 
-    # 9,10: spawn stats (directly from env)
-    spawn_count = env.spawn_count_grid.astype(np.float32)
-    spawn_prob = env.spawn_prob_grid.astype(np.float32)
+    # 9,10: spawn stats
+    spawn_count = env.spawn_count_grid
+    spawn_prob = env.spawn_prob_grid
 
     max_count = float(np.max(spawn_count))
     if max_count > 0.0:
         state[:, :, 9] = spawn_count / max_count
-    else:
-        state[:, :, 9] = 0.0
     state[:, :, 10] = spawn_prob
 
     # 0: agent position
     ar, ac = agent_loc
     state[ar, ac, 0] = 1.0
 
-    # Distance normalization factor
-    finite = env._dist_matrix[np.isfinite(env._dist_matrix)]
-    max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+    # cached normalization factor
+    max_dist = getattr(env, "_max_dist", 1.0)
     if max_dist <= 0.0:
         max_dist = 1.0
 
@@ -227,26 +238,36 @@ def encode_obs(obs, env):
     # 8: load norm
     state[:, :, 8] = float(agent_load) / float(env.agent_capacity)
 
-    # Items: channels 1,2,5 + NEW channel 11 priority ratio
+    # Items: channels 1,2,5 + channel 11 priority ratio
     mrt = float(env.max_response_time)
+
+    s1 = state[:, :, 1]
+    s2 = state[:, :, 2]
+    s5 = state[:, :, 5]
+    s11 = state[:, :, 11]
+
     for (loc, age) in zip(item_locs, item_times):
         r, c = loc
         age_f = float(age)
-        rem = max(0.0, mrt - age_f)
+        rem = mrt - age_f
+        if rem < 0.0:
+            rem = 0.0
 
-        # 1,2,5 (old)
-        state[r, c, 1] = 1.0
-        state[r, c, 2] = age_f / mrt
-        state[r, c, 5] = rem / mrt
+        s1[r, c] = 1.0
+        s2[r, c] = age_f / mrt
+        s5[r, c] = rem / mrt
 
-        # 11: priority ratio (new)
-        d_agent = float(dist_agent_grid[r, c])  # steps (graph)
-        d_target = float(dist_base_grid[r, c])  # steps (graph)
-        t_i = max(1.0, rem)  # avoid div by 0
+        d_agent = float(dist_agent_grid[r, c])
+        d_target = float(dist_base_grid[r, c])
+        t_i = rem if rem >= 1.0 else 1.0
 
         pr = (1.0 / (1.0 + d_agent) + 1.0 / (1.0 + d_target)) * (1.0 / t_i)
-        pr_norm = np.clip(pr / 2.0, 0.0, 1.0)
-        state[r, c, 11] = pr_norm
+        pr_norm = pr / 2.0
+        if pr_norm < 0.0:
+            pr_norm = 0.0
+        elif pr_norm > 1.0:
+            pr_norm = 1.0
+        s11[r, c] = pr_norm
 
     return state.reshape(-1)
 
@@ -387,7 +408,7 @@ class GymEnvironment:
 
             mode = "training" if training else "validation"
             obs = self.env.reset(mode=mode)
-            state_vec = encode_obs(obs, self.env).reshape(1, -1)
+            state_vec = encode_obs(obs, self.env)[None, :]
 
             done = 0
             rwd = 0.0
@@ -402,7 +423,7 @@ class GymEnvironment:
                 action = agent.select_action(state_vec, valid_actions=valid_actions, training=training)
 
                 reward, next_obs, done = self.env.step(action)
-                next_state_vec = encode_obs(next_obs, self.env).reshape(1, -1)
+                next_state_vec = encode_obs(next_obs, self.env)[None, :]
                 rwd += float(reward)
 
                 truncated = (t + 1 >= self.max_timesteps)
@@ -452,7 +473,7 @@ class UniformReplayBuffer:
         self.actions = np.zeros((capacity,), dtype=np.int32)
         self.rewards = np.zeros((capacity,), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
-        self.dones = np.zeros((capacity,), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.uint8)  # RAM: uint8 instead of float32
 
     def __len__(self):
         return self.n
@@ -463,7 +484,7 @@ class UniformReplayBuffer:
         self.actions[i] = a
         self.rewards[i] = r
         self.next_states[i] = ns
-        self.dones[i] = d
+        self.dones[i] = 1 if d else 0
         self.ptr = (self.ptr + 1) % self.capacity
         self.n = min(self.n + 1, self.capacity)
 
@@ -475,7 +496,7 @@ class UniformReplayBuffer:
             self.actions[idxs],
             self.rewards[idxs],
             self.next_states[idxs],
-            self.dones[idxs],
+            self.dones[idxs].astype(np.float32),
             idxs,
             weights
         )
@@ -531,7 +552,7 @@ class PrioritizedReplayBuffer:
         self.actions = np.zeros((capacity,), dtype=np.int32)
         self.rewards = np.zeros((capacity,), dtype=np.float32)
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
-        self.dones = np.zeros((capacity,), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.uint8)  # RAM: uint8 instead of float32
 
         self.sumtree = SumTree(capacity)
         self.max_priority = 1.0
@@ -551,7 +572,7 @@ class PrioritizedReplayBuffer:
         self.actions[i] = a
         self.rewards[i] = r
         self.next_states[i] = ns
-        self.dones[i] = d
+        self.dones[i] = 1 if d else 0
 
         p = (self.max_priority + self.eps) ** self.alpha
         self.sumtree.add(float(p), i)
@@ -585,7 +606,7 @@ class PrioritizedReplayBuffer:
             self.actions[idxs],
             self.rewards[idxs],
             self.next_states[idxs],
-            self.dones[idxs],
+            self.dones[idxs].astype(np.float32),
             idxs,
             w.astype(np.float32)
         )
@@ -865,40 +886,61 @@ class DQN_Agent:
         if self.epsilon > self.epsilon_min:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
+    # -------- PATCH: in-place soft target update (fixes memory spikes) --------
     def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+
         w = self.model.get_weights()
         tw = self.target_model.get_weights()
-        self.target_model.set_weights([
-            self.tau * wi + (1.0 - self.tau) * twi
-            for wi, twi in zip(w, tw)
-        ])
 
+        # in-place: tw[i] = (1-tau)*tw[i] + tau*w[i]
+        for i in range(len(tw)):
+            tw[i] *= one_minus
+            tw[i] += tau * w[i]
+
+        self.target_model.set_weights(tw)
+
+    # -------- PATCH: vectorized valid-action mask --------
     def _valid_action_mask_from_states(self, states):
         batch = states.shape[0]
         grid = states.reshape(batch, HEIGHT, WIDTH, CHANNELS)
 
         mask = np.zeros((batch, self.action_size), dtype=bool)
-        mask[:, 0] = True
+        mask[:, 0] = True  # idle
 
-        agent_layer = grid[:, :, :, 0]
-        eligible_layer = grid[:, :, :, 6] > 0.5
+        agent_layer = grid[:, :, :, 0] > 0.5
+        eligible = grid[:, :, :, 6] > 0.5
 
-        moves = [
-            (1, -1, 0),
-            (2, 0, 1),
-            (3, 1, 0),
-            (4, 0, -1),
-        ]
+        flat = agent_layer.reshape(batch, -1)
+        pos = flat.argmax(axis=1)
+        ar = pos // WIDTH
+        ac = pos % WIDTH
 
-        for b in range(batch):
-            pos = np.argwhere(agent_layer[b] > 0.5)
-            if pos.size == 0:
-                continue
-            ar, ac = pos[0]
-            for act, dr, dc in moves:
-                nr, nc = ar + dr, ac + dc
-                if 0 <= nr < HEIGHT and 0 <= nc < WIDTH and eligible_layer[b, nr, nc]:
-                    mask[b, act] = True
+        bidx = np.arange(batch)
+
+        def inside(r, c):
+            return (r >= 0) & (r < HEIGHT) & (c >= 0) & (c < WIDTH)
+
+        # up (1)
+        r = ar - 1; c = ac
+        ok = inside(r, c) & eligible[bidx, np.clip(r, 0, HEIGHT-1), np.clip(c, 0, WIDTH-1)]
+        mask[ok, 1] = True
+
+        # right (2)
+        r = ar; c = ac + 1
+        ok = inside(r, c) & eligible[bidx, np.clip(r, 0, HEIGHT-1), np.clip(c, 0, WIDTH-1)]
+        mask[ok, 2] = True
+
+        # down (3)
+        r = ar + 1; c = ac
+        ok = inside(r, c) & eligible[bidx, np.clip(r, 0, HEIGHT-1), np.clip(c, 0, WIDTH-1)]
+        mask[ok, 3] = True
+
+        # left (4)
+        r = ar; c = ac - 1
+        ok = inside(r, c) & eligible[bidx, np.clip(r, 0, HEIGHT-1), np.clip(c, 0, WIDTH-1)]
+        mask[ok, 4] = True
 
         return mask
 
@@ -911,29 +953,29 @@ class DQN_Agent:
         batch_idx = np.arange(self.batch_size, dtype=np.int32)
 
         if not self.use_distributional:
-            q_next_online = self.model(NS, training=False).numpy()
+            # -------- PATCH: predict_on_batch to reduce TF->NumPy overhead --------
+            q_next_online = self.model.predict_on_batch(NS)
             q_next_online[~valid_next_mask] = -1e9
             best_next_actions = np.argmax(q_next_online, axis=1)
 
-            q_next_target = self.target_model(NS, training=False).numpy()
+            q_next_target = self.target_model.predict_on_batch(NS)
             q_next_target[~valid_next_mask] = -1e9
             best_next_q = q_next_target[batch_idx, best_next_actions]
 
             Tgt = R + self.gamma_n * best_next_q * (1.0 - D)
 
-            q_curr = self.model(S, training=False).numpy()
+            q_curr = self.model.predict_on_batch(S)
             q_chosen = q_curr[batch_idx, A]
             td_errors = Tgt - q_chosen
 
             q_curr[batch_idx, A] = Tgt
 
-            # apply PER importance weights
             self.model.train_on_batch(S, q_curr, sample_weight=is_w)
             self.memory.update_priorities(idxs, np.abs(td_errors))
 
         else:
-            dist_next_online = self.model(NS, training=False).numpy()
-            dist_next_target = self.target_model(NS, training=False).numpy()
+            dist_next_online = self.model.predict_on_batch(NS)
+            dist_next_target = self.target_model.predict_on_batch(NS)
 
             q_next_online = np.sum(self.z[None, None, :] * dist_next_online, axis=2)
             q_next_online[~valid_next_mask] = -1e9
@@ -961,7 +1003,7 @@ class DQN_Agent:
                         m[i, lj] += p * (uj - bj)
                         m[i, uj] += p * (bj - lj)
 
-            dist_curr = self.model(S, training=False).numpy()
+            dist_curr = self.model.predict_on_batch(S)
             dist_a = dist_curr[batch_idx, A, :]
 
             eps = 1e-8
@@ -997,7 +1039,7 @@ def evaluate_average_reward(agent, variant, data_dir, episodes=100, mode="testin
     total = 0.0
     for _ in range(max_eps):
         obs = env.reset(mode)
-        s_vec = encode_obs(obs, env).reshape(1, -1)
+        s_vec = encode_obs(obs, env)[None, :]
         done = 0
         ep_ret = 0.0
         steps = 0
@@ -1006,7 +1048,7 @@ def evaluate_average_reward(agent, variant, data_dir, episodes=100, mode="testin
             valid_actions = compute_valid_actions(env)
             a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
             r, nxt, done = env.step(a)
-            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            s_vec = encode_obs(nxt, env)[None, :]
             ep_ret += float(r)
             steps += 1
 
@@ -1029,9 +1071,9 @@ if __name__ == "__main__":
     NO_OF_ACTIONS = 5
 
     # Greedy benchmark (set your known value here if you have it)
-    GREEDY_BENCHMARK = None  # e.g. 240.0
+    GREEDY_BENCHMARK = 250.685  # e.g. 240.0
 
-    # ---- Your BO-best "Combo 2" (from your earlier message) ----
+    # ---- Your BO-best "Combo 2" ----
     CONFIG_COMBO2 = dict(
         gamma=0.9389065584049,
         epsilon=1.0,
