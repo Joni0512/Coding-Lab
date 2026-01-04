@@ -1,13 +1,10 @@
 # ============================================================
 # Noisy Dueling Double-DQN with CNN (VARIANT 2)
 # + Potential feature channel Φ (channel 9)  -> 10 channels total
-#
-# FIX for your crash after ~episode 500:
-# - Replaced numpy-based soft target update (get_weights/set_weights copies)
-#   with in-place TF assign update to avoid RAM fragmentation/leaks.
-# - (Optional) GPU memory growth enabled.
-#
-# Everything else is kept the same style/structure.
+# FIX:
+# - Proper PER: use importance-sampling weights in the loss (GradientTape)
+# - PER sampling: direct leaf indexing (no big slice copy)
+# - Keep your in-place TF soft target update to avoid RAM fragmentation.
 # ============================================================
 
 # ------------- Reproducibility / Quiet logs -----------------
@@ -573,26 +570,35 @@ class PrioritizedReplayBuffer:
         self.rewards[i] = r
         self.next_states[i] = ns
         self.dones[i] = d
+
         p = (self.max_priority + self.eps) ** self.alpha
         self.sumtree.add(p, i)
+
         self.ptr = (self.ptr + 1) % self.capacity
         self.n = min(self.n + 1, self.capacity)
 
     def sample(self, batch_size):
         total = self.sumtree.total()
         seg = total / max(1, batch_size)
+
         idxs = []
         for i in range(batch_size):
             mass = np.random.uniform(i * seg, (i + 1) * seg)
             idx = self.sumtree.find_prefixsum_idx(mass)
+
+            # safety: if tree returns an index not yet filled, fallback
             if idx >= self.n:
                 idx = np.random.randint(self.n)
             idxs.append(idx)
+
         idxs = np.array(idxs, dtype=np.int32)
 
-        p = self.sumtree.tree[self.sumtree.capacity:self.sumtree.capacity + self.sumtree.capacity][idxs]
+        # ---- FIX: direct leaf indexing, no large slice-copy ----
+        leaf_idx = idxs + self.sumtree.capacity
+        p = self.sumtree.tree[leaf_idx]
         p = np.clip(p, 1e-12, None)
-        P = p / total
+        P = p / max(1e-12, total)
+
         self._beta_updates += 1
         w = (self.n * P) ** (-self.beta)
         w = w / (w.max() + 1e-12)
@@ -743,6 +749,9 @@ class DQN_Agent:
         self.total_updates = 0
         self._n_step_buffer = deque(maxlen=self.n_step)
 
+        # ---- FIX: loss objects for weighted PER training ----
+        self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+
     def _dense_layer(self, units, activation=None):
         if self.use_noisy:
             return NoisyDense(units, activation=activation, sigma0=self.noisy_sigma0)
@@ -873,8 +882,7 @@ class DQN_Agent:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     # -------------------- IMPORTANT FIX --------------------
-    # Old version used get_weights()/set_weights() which repeatedly allocates numpy arrays.
-    # That can fragment RAM and crash later. This version updates TF variables in-place.
+    # In-place TF soft update (stable).
     def _soft_update_target(self):
         tau = float(self.tau)
         one_minus = 1.0 - tau
@@ -910,15 +918,31 @@ class DQN_Agent:
 
         return mask
 
+    @tf.function
+    def _train_step_weighted_q(self, S, A, Tgt, is_w):
+        # S: [B, state], A: [B], Tgt: [B], is_w: [B]
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)                         # [B, act]
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)                              # [B]
+
+            per_sample = self._huber_none(Tgt, q_sa)                     # [B]
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
     def update_weights(self):
         if len(self.memory) < self.learn_start:
             return
 
         S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
         valid_next_mask = self._valid_action_mask_from_states(NS)
-        batch_idx = np.arange(self.batch_size, dtype=np.int32)
 
         if not self.use_distributional:
+            # Double DQN target with action masking
             q_next_online = self.model.predict(NS, verbose=0)
             q_next_online[~valid_next_mask] = -1e9
             best_next_actions = np.argmax(q_next_online, axis=1)
@@ -927,18 +951,23 @@ class DQN_Agent:
             q_next_target[~valid_next_mask] = -1e9
             best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions]
 
-            Tgt = R + self.gamma_n * best_next_q * (1.0 - D)
+            Tgt_np = R + self.gamma_n * best_next_q * (1.0 - D)
 
-            q_curr = self.model.predict(S, verbose=0)
-            q_chosen = q_curr[np.arange(self.batch_size), A]
-            td_errors = Tgt - q_chosen
+            # ---- FIX: weighted PER training (GradientTape) ----
+            S_tf = tf.convert_to_tensor(S, dtype=tf.float32)
+            A_tf = tf.convert_to_tensor(A, dtype=tf.int32)
+            Tgt_tf = tf.convert_to_tensor(Tgt_np, dtype=tf.float32)
+            w_tf = tf.convert_to_tensor(is_w, dtype=tf.float32)
 
-            q_curr[np.arange(self.batch_size), A] = Tgt
-            self.model.train_on_batch(S, q_curr)
+            _, td_tf = self._train_step_weighted_q(S_tf, A_tf, Tgt_tf, w_tf)
 
-            self.memory.update_priorities(idxs, np.abs(td_errors))
+            td_errors = td_tf.numpy()
+            if self.use_per:
+                self.memory.update_priorities(idxs, np.abs(td_errors))
 
         else:
+            # Distributional part left mostly as-is, but you should also weight CE if you use PER there.
+            # For now: keep your original behavior + priority updates via KL.
             dist_next_online = self.model.predict(NS, verbose=0)
             dist_next_target = self.target_model.predict(NS, verbose=0)
 
@@ -946,6 +975,7 @@ class DQN_Agent:
             q_next_online[~valid_next_mask] = -1e9
             best_next_actions = np.argmax(q_next_online, axis=1)
 
+            batch_idx = np.arange(self.batch_size, dtype=np.int32)
             next_dist = dist_next_target[batch_idx, best_next_actions, :]
 
             Tz = R[:, None] + (self.gamma_n * (1.0 - D))[:, None] * self.z[None, :]
@@ -981,8 +1011,11 @@ class DQN_Agent:
             y = dist_curr.copy()
             y[batch_idx, A, :] = m
 
+            # NOTE: Here IS-weights are not used. If you want full PER correctness for distributional,
+            # you should also implement weighted cross-entropy with GradientTape.
             self.model.train_on_batch(S, y)
-            self.memory.update_priorities(idxs, kl)
+            if self.use_per:
+                self.memory.update_priorities(idxs, kl)
 
         # soft update target (in-place, stable)
         self._soft_update_target()
@@ -1036,10 +1069,8 @@ if __name__ == "__main__":
     TEST_EPISODES_FINAL = 100
     NO_OF_ACTIONS = 5
 
-    # if you have a greedy benchmark for variant 2, set it here (optional)
     GREEDY_BENCHMARK_V2 = 0.0
 
-    # same style config as your combo (you can change values)
     BASE_CONFIG = dict(
         gamma=0.9389065584049,
         epsilon=1.0,
@@ -1068,7 +1099,6 @@ if __name__ == "__main__":
     save_folder = os.path.join(wd, 'save_folder_variant2')
     os.makedirs(save_folder, exist_ok=True)
 
-    # infer state size
     env_tmp = Environment(VARIANT, DATA_DIR)
     obs0 = env_tmp.reset("training")
     state_sample = encode_obs(obs0, env_tmp)
@@ -1087,17 +1117,14 @@ if __name__ == "__main__":
         render_every=2
     )
 
-    # train
     rew_train = env_train.trainDQN(agent, TRAIN_EPISODES_FULL)
 
-    # eval
     avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=VAL_EPISODES_FINAL, mode="validation")
     avg_test = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=TEST_EPISODES_FINAL, mode="testing")
 
     print(f"[Variant {VARIANT}] Validation avg over {VAL_EPISODES_FINAL} episodes: {avg_val:.3f}")
     print(f"[Variant {VARIANT}] Test       avg over {TEST_EPISODES_FINAL} episodes: {avg_test:.3f}")
 
-    # plot
     plt.figure(figsize=(14, 6))
     window = 25
     kernel = np.ones(window, dtype=np.float32) / float(window)
@@ -1124,7 +1151,7 @@ if __name__ == "__main__":
         )
 
     plt.title("Variant 2 – Dueling Double DQN (Noisy) mit Φ-Feature\n"
-              "800 Training, 100 Validation, 100 Testing (stabiler soft-update)")
+              "800 Training, 100 Validation, 100 Testing (PER korrekt gewichtet + stabiler soft-update)")
     plt.xlabel("Training episode")
     plt.ylabel("Reward")
     plt.legend()
