@@ -1,8 +1,10 @@
 # ============================================================
 # Noisy Dueling Double-DQN with CNN (VARIANT 2)
 # + Potential feature channel Φ (channel 9)  -> 10 channels total
-# + EXPERIMENT 1: Masked ConvLSTM Planner (Gated-style planner)
-#   - after each recurrent step: h *= eligible_mask, c *= eligible_mask
+# + EXPERIMENT 1 (Option A): Masked ConvLSTM Planner via ConvLSTM2D
+#   - repeat constant features K times
+#   - apply eligible mask to features at EVERY step (holes => 0 input)
+#   - final safety mask on h_last
 #   - Q-map readout at agent cell
 #
 # FIXES (kept from your provided version):
@@ -686,54 +688,6 @@ class NoisyDense(tf.keras.layers.Layer):
 
 
 # ============================================================
-# 7b. EXPERIMENT 1: Masked ConvLSTM planner cell
-# ============================================================
-
-class MaskedConvLSTMCell(tf.keras.layers.Layer):
-    """
-    Wrap ConvLSTM2DCell and apply spatial mask to h and c after each step:
-      h *= mask, c *= mask
-
-    Expects inputs: [B,H,W,Cfeat+1] where last channel is eligible mask (1).
-    """
-    def __init__(self, filters, kernel_size=3, **kwargs):
-        super().__init__(**kwargs)
-        self.filters = int(filters)
-        self.kernel_size = kernel_size
-        self.cell = tf.keras.layers.ConvLSTM2DCell(
-            filters=self.filters,
-            kernel_size=self.kernel_size,
-            padding="same",
-        )
-
-    @property
-    def state_size(self):
-        return self.cell.state_size
-
-    @property
-    def output_size(self):
-        return self.cell.output_size
-
-    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
-        return self.cell.get_initial_state(inputs=inputs, batch_size=batch_size, dtype=dtype)
-
-    def call(self, inputs, states, training=None):
-        feat = inputs[:, :, :, :-1]
-        mask = inputs[:, :, :, -1:]  # [B,H,W,1]
-        mask = tf.cast(mask > 0.5, tf.float32)
-
-        out, new_states = self.cell(feat, states, training=training)
-        h, c = new_states
-
-        # forbid hidden state in holes
-        h = h * mask
-        c = c * mask
-        out = out * mask
-
-        return out, [h, c]
-
-
-# ============================================================
 # 8. DQN_Agent (PER fix included + Experiment 1 model)
 # ============================================================
 
@@ -814,7 +768,7 @@ class DQN_Agent:
         return Dense(units, activation=activation)
 
     # ========================================================
-    # EXPERIMENT 1: Masked ConvLSTM planner + agent-cell readout
+    # EXPERIMENT 1 (Option A): ConvLSTM2D planner + agent-cell readout
     # ========================================================
     def _build_model(self, state_size, action_size, units, old_model_path=''):
         DenseLayer = self._dense_layer
@@ -837,14 +791,27 @@ class DQN_Agent:
         def repeat_k(t):
             t = tf.expand_dims(t, axis=1)      # [B,1,H,W,C]
             return tf.tile(t, [1, K, 1, 1, 1]) # [B,K,H,W,C]
-        seq = Lambda(repeat_k, name="repeat_K")(x_plus)
+        seq = Lambda(repeat_k, name="repeat_K")(x_plus)  # [B,K,5,5,65]
 
-        # Masked ConvLSTM planner (gated recurrent)
-        cell = MaskedConvLSTMCell(filters=64, kernel_size=3)
-        planner = tf.keras.layers.RNN(cell, return_sequences=False, name="masked_convlstm_planner")
-        h_last = planner(seq)  # [B,5,5,64]
+        # --------- OPTION A FIX: use ConvLSTM2D (available) ----------
+        # Split features and mask per timestep
+        seq_feat = Lambda(lambda t: t[:, :, :, :, :-1], name="seq_feat")(seq)  # [B,K,5,5,64]
+        seq_mask = Lambda(lambda t: t[:, :, :, :, -1:], name="seq_mask")(seq)  # [B,K,5,5,1]
 
-        # final safety mask
+        # Apply eligible mask at every step to the inputs (holes => 0)
+        seq_feat = tf.keras.layers.Multiply(name="mask_feat_each_step")([seq_feat, seq_mask])
+
+        # ConvLSTM over the K steps
+        h_last = tf.keras.layers.ConvLSTM2D(
+            filters=64,
+            kernel_size=3,
+            padding="same",
+            return_sequences=False,
+            name="masked_convlstm_planner"
+        )(seq_feat)  # [B,5,5,64]
+        # ------------------------------------------------------------
+
+        # final safety mask (keep)
         h_last = tf.keras.layers.Multiply(name="final_mask_apply")([h_last, eligible_mask])
 
         # Q-map over cells
@@ -869,7 +836,6 @@ class DQN_Agent:
 
         q = Lambda(gather_agent_q, name="q_agent")([q_map, agent_layer])
 
-        # NOTE: we keep compile settings identical to your original
         model = Model(inputs=inp, outputs=q)
         model.compile(
             optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
@@ -1058,7 +1024,6 @@ class DQN_Agent:
 
         else:
             # Distributional part left mostly as-is, but you should also weight CE if you use PER there.
-            # For now: keep your original behavior + priority updates via KL.
             dist_next_online = self.model.predict(NS, verbose=0)
             dist_next_target = self.target_model.predict(NS, verbose=0)
 
@@ -1102,8 +1067,6 @@ class DQN_Agent:
             y = dist_curr.copy()
             y[batch_idx, A, :] = m
 
-            # NOTE: Here IS-weights are not used. If you want full PER correctness for distributional,
-            # you should also implement weighted cross-entropy with GradientTape.
             self.model.train_on_batch(S, y)
             if self.use_per:
                 self.memory.update_priorities(idxs, kl)
@@ -1245,7 +1208,7 @@ if __name__ == "__main__":
             label=f"Greedy benchmark ({GREEDY_BENCHMARK_V2:.2f})"
         )
 
-    plt.title("Variant 2 – Double DQN (Noisy) + PER (fixed) + EXP1 Masked-ConvLSTM Planner\n"
+    plt.title("Variant 2 – Double DQN (Noisy) + PER (fixed) + EXP1 ConvLSTM2D Masked Planner (Option A)\n"
               "800 Training, 100 Validation, 100 Testing")
     plt.xlabel("Training episode")
     plt.ylabel("Reward")
