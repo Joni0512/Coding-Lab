@@ -1,0 +1,1152 @@
+# ============================================================
+# Noisy Dueling Double-DQN with CNN (VARIANT 0)
+# Potential feature channel Φ (channel 9)  -> 10 channels total
+#
+# + EXPERIMENT 1 (Option A): ConvLSTM2D Planner (works in your TF)
+#   - repeat constant features K times
+#   - apply eligible mask to features at EVERY step (for v0 mask is all-ones, harmless)
+#   - final safety mask on h_last
+#   - DUELING Q-MAP head (V-map + A-map)  ✅ (proper dueling)
+#   - Q-map readout at agent cell
+#
+# FIXES kept:
+# - Proper PER: use importance-sampling weights in the loss (GradientTape)
+# - PER sampling: direct leaf indexing (no big slice copy)
+# - In-place TF soft target update
+# ============================================================
+
+# ------------- Reproducibility / Quiet logs -----------------
+seed = 165
+import os
+os.environ["PYTHONHASHSEED"] = str(seed)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import random
+random.seed(seed)
+
+import numpy as np
+np.random.seed(seed)
+
+import tensorflow as tf
+tf.random.set_seed(seed)
+
+# --- Optional: GPU memory growth ----
+try:
+    gpus = tf.config.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+except Exception:
+    pass
+
+# --- SciPy for shortest paths --------
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+# ============================================================
+# Environment
+# ============================================================
+from environment import Environment
+
+# ============================================================
+# TF / Keras, plotting
+# ============================================================
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+
+from collections import deque
+import warnings
+
+import matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+DATA_DIR = "./data"
+
+# ============================================================
+# 1. Distance structures
+# ============================================================
+
+def _build_distance_structs(env):
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+
+    variant = env.variant
+    H, W = 5, 5
+
+    if variant in (0, 1):
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_r, i_c = i // 5, i % 5
+                j_r, j_c = j // 5, j % 5
+                if (j_r - i_r == 0 and j_c - i_c == 1) or (j_r - i_r == 1 and j_c - i_c == 0):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    else:
+        # variant 2 "holey" layout mapping (not used here, but kept for completeness)
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3),
+            (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1)
+        link(1, 2)
+        link(2, 3)
+        link(3, 4)
+        link(3, 5)
+        link(4, 6)
+        link(5, 6)
+        link(5, 10)
+        link(6, 11)
+        link(7, 8)
+        link(7, 12)
+        link(8, 9)
+        link(9, 10)
+        link(10, 11)
+        link(12, 13)
+        link(13, 14)
+        link(14, 15)
+        link(15, 16)
+        link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    env._dist_ready = True
+
+
+def _coord_to_idx(env, coord):
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    return env._coord_to_idx[coord]
+
+
+# ============================================================
+# 2. CNN observation encoding (+ Φ potential plane)
+# ============================================================
+
+HEIGHT = 5
+WIDTH = 5
+CHANNELS = 10  # 0..8 + 9 = Φ
+
+
+def encode_obs(obs, env):
+    """
+    Returns flat vector length 5*5*10 = 250.
+    Channel 9 is Φ potential plane.
+    """
+    step, agent_loc, agent_load, item_locs, item_times = obs
+
+    _build_distance_structs(env)
+
+    H, W, C = HEIGHT, WIDTH, CHANNELS
+    state = np.zeros((H, W, C), dtype=np.float32)
+
+    # 6: eligible mask (v0/v1 all cells eligible; v2 holes supported)
+    eligible_set = set(env.eligible_cells)
+    for r in range(H):
+        for c in range(W):
+            state[r, c, 6] = 1.0 if (r, c) in eligible_set else 0.0
+
+    # 0: agent position
+    ar, ac = agent_loc
+    state[ar, ac, 0] = 1.0
+
+    # 1,2,5: items
+    for (loc, age) in zip(item_locs, item_times):
+        r, c = loc
+        state[r, c, 1] = 1.0
+        state[r, c, 2] = age / env.max_response_time
+        state[r, c, 5] = (env.max_response_time - age) / env.max_response_time
+
+    # 3: distance agent->cell
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]  # 5x5
+    max_dist = getattr(env, "_max_dist", 1.0)
+    if max_dist <= 0:
+        max_dist = 1.0
+    state[:, :, 3] = dist_agent_grid / max_dist
+
+    # 4: distance base->cell
+    state[:, :, 4] = env._dist_base_grid / max_dist
+
+    # 7: step norm
+    state[:, :, 7] = step / float(env.episode_steps)
+
+    # 8: load norm
+    state[:, :, 8] = agent_load / float(env.agent_capacity)
+
+    # 9: Φ potential feature (best item heuristic)
+    ALPHA = 1.0
+    BETA = 1.0
+    phi_plane = np.zeros((H, W), dtype=np.float32)
+
+    if len(item_locs) > 0:
+        best_phi = -np.inf
+        best_ttl = 0.0
+
+        for (loc, age) in zip(item_locs, item_times):
+            r, c = loc
+            d_norm = dist_agent_grid[r, c] / max_dist
+            ttl = (env.max_response_time - age) / env.max_response_time
+            phi = -ALPHA * d_norm + BETA * ttl
+            if phi > best_phi:
+                best_phi = phi
+                best_ttl = ttl
+
+        phi_plane = -ALPHA * (dist_agent_grid / max_dist) + BETA * best_ttl
+        phi_plane = np.clip(phi_plane, -1.0, 1.0)
+
+    state[:, :, 9] = phi_plane
+
+    return state.reshape(-1)  # 250
+
+
+# ============================================================
+# 3. Minimal renderer (optional)
+# ============================================================
+
+class PrettyRenderer:
+    def __init__(self, env, fps=8, render_every=2):
+        self.env = env
+        self.pause = 1.0 / max(1e-3, fps)
+        self.render_every = max(1, int(render_every))
+        self.fig = None
+        self.ax = None
+        self.agent_artist = None
+        self.target_artist = None
+        self.item_artists = []
+
+    def _setup_canvas(self):
+        if self.fig is not None:
+            return
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(5.6, 5.6))
+        ax = self.ax
+        ax.set_aspect('equal')
+        H, W = self.env.vertical_cell_count, self.env.horizontal_cell_count
+        ax.set_xlim(-0.5, W - 0.5)
+        ax.set_ylim(H - 0.5, -0.5)
+        ax.set_xticks(np.arange(-.5, W, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, H, 1), minor=True)
+        ax.grid(which='minor', linestyle='-', linewidth=0.6, alpha=0.28)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        for r in range(H):
+            for c in range(W):
+                is_hole = (self.env.variant == 2) and ((r, c) not in self.env.eligible_cells)
+                col = (0.965, 0.965, 1.0) if not is_hole else (0.85, 0.85, 0.88)
+                ax.add_patch(Rectangle((c - 0.5, r - 0.5), 1, 1,
+                                       facecolor=col, edgecolor='none', zorder=0))
+
+        tr, tc = self.env.target_loc
+        self.target_artist = ax.text(tc, tr, "T", ha='center', va='center',
+                                     fontsize=18, fontweight='bold', zorder=3)
+        ar, ac = self.env.agent_loc
+        self.agent_artist = ax.text(ac, ar, "A", ha='center', va='center',
+                                    fontsize=20, color='blue', fontweight='bold', zorder=4)
+
+    def draw(self, step, ep_return, action=None):
+        if step % self.render_every != 0:
+            return
+        self._setup_canvas()
+        ax = self.ax
+        for it in self.item_artists:
+            it.remove()
+        self.item_artists.clear()
+
+        for (ir, ic) in self.env.item_locs:
+            txt = ax.text(ic, ir, "*", ha='center', va='center', fontsize=18,
+                          color='orange', zorder=3)
+            self.item_artists.append(txt)
+
+        ar, ac = self.env.agent_loc
+        self.agent_artist.set_position((ac, ar))
+        names = {0: "idle", 1: "up", 2: "right", 3: "down", 4: "left"}
+        ax.set_title(f"Step {step} | Return: {ep_return:.2f} | Action: {names.get(action, '-')}",
+                     fontsize=11, pad=8)
+        plt.pause(self.pause)
+
+    def close(self):
+        plt.ioff()
+        if self.fig is not None:
+            plt.show()
+
+
+# ============================================================
+# 4. Action masking helper
+# ============================================================
+
+def compute_valid_actions(env):
+    valid = [0]  # idle
+    r, c = env.agent_loc
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    moves = [
+        (1, -1, 0),  # up
+        (2, 0, 1),   # right
+        (3, 1, 0),   # down
+        (4, 0, -1),  # left
+    ]
+    for act, dr, dc in moves:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < H and 0 <= nc < W and (nr, nc) in env.eligible_cells:
+            valid.append(act)
+
+    return np.array(valid, dtype=np.int32)
+
+
+# ============================================================
+# 5. GymEnvironment wrapper
+# ============================================================
+
+class GymEnvironment:
+    def __init__(self, env_id, save_path, render=False, variant=0, data_dir="./data",
+                 pretty_render=False, fps=8, render_every=2):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.variant = variant
+        self.max_timesteps = getattr(self.env, "episode_steps", 200)
+        self.save_path = save_path
+        self.pretty_render = pretty_render
+        self.fps = fps
+        self.render_every = render_every
+
+    def trainDQN(self, agent, no_episodes):
+        rew = self.runDQN(agent, no_episodes, training=True, evaluation=False)
+        agent.model.save_weights(
+            os.path.join(self.save_path, f"dueling_double_dqn_variant{self.variant}.weights.h5"),
+            overwrite=True
+        )
+        return rew
+
+    def runDQN(self, agent, no_episodes, training=False, evaluation=False):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+        viz = PrettyRenderer(self.env, fps=self.fps, render_every=self.render_every) \
+            if (self.pretty_render and training) else None
+
+        for episode in range(no_episodes):
+            if training:
+                if episode < 400:
+                    update_every = 8
+                    per_update_steps = 1
+                else:
+                    update_every = 4
+                    per_update_steps = 1
+            else:
+                update_every = 4
+                per_update_steps = 1
+
+            mode = "training" if training else "validation"
+            obs = self.env.reset(mode=mode)
+            state_vec = encode_obs(obs, self.env).reshape(1, -1)
+            done = 0
+            rwd = 0.0
+            t = 0
+            if viz:
+                viz.draw(step=t, ep_return=rwd, action=None)
+            step_since_update = 0
+
+            while not done and t < self.max_timesteps:
+                valid_actions = compute_valid_actions(self.env)
+                action = agent.select_action(state_vec, valid_actions=valid_actions, training=training)
+
+                reward, next_obs, done = self.env.step(action)
+                next_state_vec = encode_obs(next_obs, self.env).reshape(1, -1)
+                rwd += reward
+
+                truncated = (t + 1 >= self.max_timesteps)
+                terminal_flag = float(done or truncated)
+
+                if training and not evaluation:
+                    agent.record(state_vec, action, reward, next_state_vec, terminal_flag)
+                    step_since_update += 1
+                    if step_since_update % update_every == 0:
+                        for _ in range(per_update_steps):
+                            agent.update_weights()
+
+                state_vec = next_state_vec
+                t += 1
+                if viz:
+                    viz.draw(step=t, ep_return=rwd, action=action)
+                if truncated:
+                    break
+
+            rew[episode] = rwd
+
+            if training:
+                if (episode + 1) % 25 == 0:
+                    start = max(0, episode + 1 - 25)
+                    avg25 = np.mean(rew[start:episode + 1])
+                    print(f"[TRAIN] Variant {self.variant} Episode {episode + 1}/{no_episodes}  "
+                          f"Return: {rwd:.1f}  |  Avg last 25: {avg25:.1f}")
+            else:
+                print(f"[VAL]   Variant {self.variant} Episode {episode + 1}/{no_episodes}  Return: {rwd:.1f}")
+
+            if training:
+                agent.update_epsilon()
+
+        if viz:
+            viz.close()
+        return rew
+
+
+# ============================================================
+# 6. Replay buffers
+# ============================================================
+
+class UniformReplayBuffer:
+    def __init__(self, state_dim, capacity=50_000):
+        self.capacity = capacity
+        self.ptr = 0
+        self.n = 0
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = a
+        self.rewards[i] = r
+        self.next_states[i] = ns
+        self.dones[i] = d
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        idxs = np.random.randint(self.n, size=batch_size)
+        weights = np.ones((batch_size,), dtype=np.float32)
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            weights
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        pass
+
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity <<= 1
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def total(self):
+        return self.tree[1]
+
+    def add(self, p: float, idx: int):
+        i = idx + self.capacity
+        delta = p - self.tree[i]
+        self.tree[i] = p
+        i //= 2
+        while i >= 1:
+            self.tree[i] += delta
+            i //= 2
+
+    def find_prefixsum_idx(self, mass: float) -> int:
+        i = 1
+        while i < self.capacity:
+            left = 2 * i
+            if self.tree[left] >= mass:
+                i = left
+            else:
+                mass -= self.tree[left]
+                i = left + 1
+        return i - self.capacity
+
+
+class PrioritizedReplayBuffer:
+    def __init__(self, state_dim, capacity=50_000, alpha=0.6, beta0=0.4,
+                 beta_final=1.0, beta_anneal_steps=200_000, eps=1e-6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.eps = eps
+        self.beta0 = beta0
+        self.beta_final = beta_final
+        self.beta_anneal_steps = max(1, beta_anneal_steps)
+        self.ptr = 0
+        self.n = 0
+
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+        self._beta_updates = 0
+
+    @property
+    def beta(self):
+        t = min(1.0, self._beta_updates / float(self.beta_anneal_steps))
+        return (1.0 - t) * self.beta0 + t * self.beta_final
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = a
+        self.rewards[i] = r
+        self.next_states[i] = ns
+        self.dones[i] = d
+
+        p = (self.max_priority + self.eps) ** self.alpha
+        self.sumtree.add(p, i)
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(mass)
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+
+        idxs = np.array(idxs, dtype=np.int32)
+
+        leaf_idx = idxs + self.sumtree.capacity
+        p = self.sumtree.tree[leaf_idx]
+        p = np.clip(p, 1e-12, None)
+        P = p / max(1e-12, total)
+
+        self._beta_updates += 1
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            w.astype(np.float32)
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        prios = (np.abs(td_errors) + self.eps) ** self.alpha
+        self.max_priority = max(self.max_priority, float(np.max(prios)))
+        for i, p in zip(idxs, prios):
+            self.sumtree.add(float(p), int(i))
+
+
+# ============================================================
+# 7. Noisy layer
+# ============================================================
+
+class NoisyDense(tf.keras.layers.Layer):
+    def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
+        super(NoisyDense, self).__init__(**kwargs)
+        self.units = units
+        self.activation = tf.keras.activations.get(activation)
+        self.sigma0 = float(sigma0)
+
+    def build(self, input_shape):
+        in_dim = int(input_shape[-1])
+        mu_range = 1.0 / np.sqrt(in_dim)
+
+        self.mu_w = self.add_weight(
+            name="mu_w",
+            shape=(in_dim, self.units),
+            initializer=tf.keras.initializers.RandomUniform(-mu_range, mu_range),
+            trainable=True,
+        )
+        self.sigma_w = self.add_weight(
+            name="sigma_w",
+            shape=(in_dim, self.units),
+            initializer=tf.keras.initializers.Constant(self.sigma0 / np.sqrt(in_dim)),
+            trainable=True,
+        )
+        self.mu_b = self.add_weight(
+            name="mu_b",
+            shape=(self.units,),
+            initializer=tf.keras.initializers.RandomUniform(-mu_range, mu_range),
+            trainable=True,
+        )
+        self.sigma_b = self.add_weight(
+            name="sigma_b",
+            shape=(self.units,),
+            initializer=tf.keras.initializers.Constant(self.sigma0 / np.sqrt(in_dim)),
+            trainable=True,
+        )
+        super(NoisyDense, self).build(input_shape)
+
+    def call(self, inputs):
+        def f(x):
+            return tf.sign(x) * tf.sqrt(tf.abs(x))
+
+        in_dim = tf.shape(self.mu_w)[0]
+        eps_in = f(tf.random.normal((in_dim,)))
+        eps_out = f(tf.random.normal((self.units,)))
+
+        eps_w = tf.tensordot(eps_in, eps_out, axes=0)
+        eps_b = eps_out
+
+        w = self.mu_w + self.sigma_w * eps_w
+        b = self.mu_b + self.sigma_b * eps_b
+
+        out = tf.matmul(inputs, w) + b
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
+
+
+# ============================================================
+# 8. DQN Agent (ConvLSTM2D planner + DUELING Q-map head)
+# ============================================================
+
+class DQN_Agent:
+    def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=''):
+        if agent_hyperparameters is None:
+            agent_hyperparameters = {}
+        self.state_size = int(state_size)
+        self.action_size = int(no_of_actions)
+
+        self.gamma = agent_hyperparameters.get('gamma', 0.99)
+        self.epsilon = agent_hyperparameters.get('epsilon', 1.0)
+        self.batch_size = agent_hyperparameters.get('batch_size', 32)
+        self.epsilon_min = agent_hyperparameters.get('epsilon_min', 0.05)
+        self.epsilon_decay = agent_hyperparameters.get('epsilon_decay', 0.995)
+        self.units = agent_hyperparameters.get('units', 64)
+
+        self.use_per = agent_hyperparameters.get('use_per', True)
+
+        per_alpha = agent_hyperparameters.get('per_alpha', 0.6)
+        per_beta0 = agent_hyperparameters.get('per_beta0', 0.4)
+        per_beta1 = agent_hyperparameters.get('per_beta1', 1.0)
+        per_eps = agent_hyperparameters.get('per_eps', 1e-6)
+        per_anneal = agent_hyperparameters.get('per_beta_anneal_steps', 200_000)
+
+        self.n_step = int(agent_hyperparameters.get('n_step', 1))
+        self.use_noisy = agent_hyperparameters.get('use_noisy', False)
+        self.noisy_sigma0 = agent_hyperparameters.get('noisy_sigma0', 0.5)
+
+        self.use_distributional = agent_hyperparameters.get('use_distributional', False)
+        self.num_atoms = int(agent_hyperparameters.get('num_atoms', 51))
+        self.vmin = float(agent_hyperparameters.get('vmin', -200.0))
+        self.vmax = float(agent_hyperparameters.get('vmax', 200.0))
+        if self.use_distributional:
+            self.z = np.linspace(self.vmin, self.vmax, self.num_atoms).astype(np.float32)
+        else:
+            self.z = None
+
+        self.gamma_n = self.gamma ** self.n_step
+        self.tau = agent_hyperparameters.get('tau', 0.001)
+
+        # planner steps (K) — for variant 0 recommended smaller, e.g. 4
+        self.planner_steps = int(agent_hyperparameters.get("planner_steps", 4))
+
+        if self.use_distributional:
+            self.model = self._build_distributional_model(self.state_size, self.action_size, self.units, old_model_path)
+            self.target_model = self._build_distributional_model(self.state_size, self.action_size, self.units)
+        else:
+            self.model = self._build_model(self.state_size, self.action_size, self.units, old_model_path)
+            self.target_model = self._build_model(self.state_size, self.action_size, self.units)
+
+        self.target_model.set_weights(self.model.get_weights())
+
+        if self.use_per:
+            self.memory = PrioritizedReplayBuffer(
+                state_dim=self.state_size,
+                capacity=50_000,
+                alpha=per_alpha,
+                beta0=per_beta0,
+                beta_final=per_beta1,
+                beta_anneal_steps=per_anneal,
+                eps=per_eps
+            )
+        else:
+            self.memory = UniformReplayBuffer(state_dim=self.state_size, capacity=50_000)
+
+        self.learn_start = max(5000, 5 * self.batch_size)
+        self.total_updates = 0
+        self._n_step_buffer = deque(maxlen=self.n_step)
+
+        self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+
+    def _dense_layer(self, units, activation=None):
+        if self.use_noisy:
+            return NoisyDense(units, activation=activation, sigma0=self.noisy_sigma0)
+        return Dense(units, activation=activation)
+
+    def _build_model(self, state_size, action_size, units, old_model_path=''):
+        K = int(self.planner_steps)
+
+        inp = Input(shape=(state_size,))
+        grid = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)  # [B,5,5,10]
+
+        eligible_mask = Lambda(lambda x: x[:, :, :, 6:7], name="eligible_mask")(grid)  # [B,5,5,1]
+        agent_layer   = Lambda(lambda x: x[:, :, :, 0:1], name="agent_layer")(grid)    # [B,5,5,1]
+
+        # CNN features
+        x = Conv2D(32, kernel_size=3, padding='same', activation='relu')(grid)
+        x = Conv2D(64, kernel_size=3, padding='same', activation='relu')(x)
+
+        # Planner input: features + eligible mask as last channel (mask is all-ones in v0)
+        x_plus = tf.keras.layers.Concatenate(axis=-1, name="feat_plus_mask")([x, eligible_mask])  # [B,5,5,65]
+
+        # Repeat constant input K times
+        def repeat_k(t):
+            t = tf.expand_dims(t, axis=1)      # [B,1,H,W,C]
+            return tf.tile(t, [1, K, 1, 1, 1]) # [B,K,H,W,C]
+        seq = Lambda(repeat_k, name="repeat_K")(x_plus)  # [B,K,5,5,65]
+
+        # Option A ConvLSTM2D planner
+        seq_feat = Lambda(lambda t: t[:, :, :, :, :-1], name="seq_feat")(seq)  # [B,K,5,5,64]
+        seq_mask = Lambda(lambda t: t[:, :, :, :, -1:], name="seq_mask")(seq)  # [B,K,5,5,1]
+
+        # Apply mask each step (in v0 it's basically 1 everywhere, so no harm)
+        seq_feat = tf.keras.layers.Multiply(name="mask_feat_each_step")([seq_feat, seq_mask])
+
+        h_last = tf.keras.layers.ConvLSTM2D(
+            filters=64,
+            kernel_size=3,
+            padding="same",
+            return_sequences=False,
+            name="convlstm_planner"
+        )(seq_feat)  # [B,5,5,64]
+
+        # final safety mask
+        h_last = tf.keras.layers.Multiply(name="final_mask_apply")([h_last, eligible_mask])
+
+        # =========================
+        # Proper DUELING Q-MAP head
+        # =========================
+        v_map = Conv2D(1, kernel_size=1, padding="same", name="v_map")(h_last)               # [B,5,5,1]
+        a_map = Conv2D(action_size, kernel_size=1, padding="same", name="a_map")(h_last)    # [B,5,5,A]
+        a_mean = Lambda(lambda t: tf.reduce_mean(t, axis=-1, keepdims=True), name="a_mean")(a_map)
+        q_map = Lambda(lambda va: va[0] + (va[1] - va[2]), name="q_map")([v_map, a_map, a_mean])  # [B,5,5,A]
+
+        # Read Q at agent cell
+        def gather_agent_q(args):
+            qmap, agent = args
+            b = tf.shape(qmap)[0]
+            Ht = tf.shape(qmap)[1]
+            Wt = tf.shape(qmap)[2]
+
+            flat = tf.reshape(agent, [b, Ht * Wt])  # [B,25]
+            idx_flat = tf.argmax(flat, axis=1, output_type=tf.int32)
+            r = idx_flat // Wt
+            c = idx_flat % Wt
+
+            batch_idx = tf.range(b, dtype=tf.int32)
+            gather_idx = tf.stack([batch_idx, r, c], axis=1)  # [B,3]
+            q = tf.gather_nd(qmap, gather_idx)                # [B,A]
+            return q
+
+        q = Lambda(gather_agent_q, name="q_agent")([q_map, agent_layer])
+
+        model = Model(inputs=inp, outputs=q)
+        model.compile(
+            optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
+            loss=Huber(delta=1.0),
+            run_eagerly=False
+        )
+        if old_model_path:
+            model.load_weights(old_model_path)
+        return model
+
+    # (kept unchanged; not used in your config)
+    def _build_distributional_model(self, state_size, action_size, units, old_model_path=''):
+        DenseLayer = self._dense_layer
+        inp = Input(shape=(state_size,))
+        x = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)
+
+        x = Conv2D(32, kernel_size=3, padding='same', activation='relu')(x)
+        x = Conv2D(64, kernel_size=3, padding='same', activation='relu')(x)
+        x = Flatten()(x)
+        x = DenseLayer(units, activation='relu')(x)
+
+        v = DenseLayer(units, activation='relu')(x)
+        v = DenseLayer(self.num_atoms)(v)
+
+        a = DenseLayer(units, activation='relu')(x)
+        a = DenseLayer(action_size * self.num_atoms)(a)
+
+        def dist_dueling(tensors):
+            v_, a_ = tensors
+            batch = tf.shape(v_)[0]
+            v_ = tf.reshape(v_, (batch, 1, self.num_atoms))
+            a_ = tf.reshape(a_, (batch, action_size, self.num_atoms))
+            a_mean = tf.reduce_mean(a_, axis=1, keepdims=True)
+            q_logits = v_ + (a_ - a_mean)
+            return tf.nn.softmax(q_logits, axis=-1)
+
+        out = Lambda(dist_dueling, name="dist_dueling")([v, a])
+
+        model = Model(inputs=inp, outputs=out)
+        model.compile(
+            optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
+            loss='categorical_crossentropy',
+            run_eagerly=False
+        )
+        if old_model_path:
+            model.load_weights(old_model_path)
+        return model
+
+    def select_action(self, state, valid_actions=None, training=True):
+        if valid_actions is None:
+            valid_actions = np.arange(self.action_size, dtype=np.int32)
+
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.choice(valid_actions))
+
+        if self.use_distributional:
+            dist = self.model.predict(state, verbose=0)[0]
+            q = np.sum(self.z * dist, axis=1)
+        else:
+            q = self.model.predict(state, verbose=0)[0]
+
+        masked_q = np.full_like(q, -1e9, dtype=np.float32)
+        masked_q[valid_actions] = q[valid_actions]
+        return int(np.argmax(masked_q))
+
+    def _add_single_transition(self, state, action, reward, next_state, done):
+        self.memory.add(state.reshape(-1), int(action), float(reward),
+                        next_state.reshape(-1), float(done))
+
+    def record(self, state, action, reward, next_state, done):
+        if self.n_step <= 1:
+            self._add_single_transition(state, action, reward, next_state, done)
+            return
+
+        self._n_step_buffer.append((state, action, reward, next_state, done))
+
+        if len(self._n_step_buffer) == self.n_step and not done:
+            self._flush_n_step()
+            self._n_step_buffer.popleft()
+
+        if done:
+            while len(self._n_step_buffer) > 0:
+                self._flush_n_step()
+                self._n_step_buffer.popleft()
+
+    def _flush_n_step(self):
+        R = 0.0
+        gamma = 1.0
+        for (_, _, r, _, d) in self._n_step_buffer:
+            R += gamma * float(r)
+            gamma *= self.gamma
+            if d:
+                break
+
+        state_0, action_0, _, _, _ = self._n_step_buffer[0]
+        _, _, _, next_state_last, done_last = self._n_step_buffer[-1]
+        self._add_single_transition(state_0, action_0, R, next_state_last, done_last)
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+        for src, tgt in zip(self.model.weights, self.target_model.weights):
+            tgt.assign(tau * src + one_minus * tgt)
+
+    def _valid_action_mask_from_states(self, states):
+        batch = states.shape[0]
+        grid = states.reshape(batch, HEIGHT, WIDTH, CHANNELS)
+
+        mask = np.zeros((batch, self.action_size), dtype=bool)
+        mask[:, 0] = True
+
+        agent_layer = grid[:, :, :, 0]
+        eligible_layer = grid[:, :, :, 6] > 0.5
+
+        for b in range(batch):
+            pos = np.argwhere(agent_layer[b] > 0.5)
+            if pos.size == 0:
+                continue
+            ar, ac = pos[0]
+            moves = [
+                (1, -1, 0),
+                (2, 0, 1),
+                (3, 1, 0),
+                (4, 0, -1),
+            ]
+            for act, dr, dc in moves:
+                nr, nc = ar + dr, ac + dc
+                if 0 <= nr < HEIGHT and 0 <= nc < WIDTH and eligible_layer[b, nr, nc]:
+                    mask[b, act] = True
+        return mask
+
+    @tf.function
+    def _train_step_weighted_q(self, S, A, Tgt, is_w):
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)
+
+            per_sample = self._huber_none(Tgt, q_sa)
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
+    def update_weights(self):
+        if len(self.memory) < self.learn_start:
+            return
+
+        S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
+        valid_next_mask = self._valid_action_mask_from_states(NS)
+
+        if not self.use_distributional:
+            q_next_online = self.model.predict(NS, verbose=0)
+            q_next_online[~valid_next_mask] = -1e9
+            best_next_actions = np.argmax(q_next_online, axis=1)
+
+            q_next_target = self.target_model.predict(NS, verbose=0)
+            q_next_target[~valid_next_mask] = -1e9
+            best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions]
+
+            Tgt_np = R + self.gamma_n * best_next_q * (1.0 - D)
+
+            S_tf = tf.convert_to_tensor(S, dtype=tf.float32)
+            A_tf = tf.convert_to_tensor(A, dtype=tf.int32)
+            Tgt_tf = tf.convert_to_tensor(Tgt_np, dtype=tf.float32)
+            w_tf = tf.convert_to_tensor(is_w, dtype=tf.float32)
+
+            _, td_tf = self._train_step_weighted_q(S_tf, A_tf, Tgt_tf, w_tf)
+            td_errors = td_tf.numpy()
+
+            if self.use_per:
+                self.memory.update_priorities(idxs, np.abs(td_errors))
+        else:
+            # not used in your config
+            self.model.train_on_batch(S, self.target_model.predict(S, verbose=0))
+
+        self._soft_update_target()
+        self.total_updates += 1
+
+
+# ============================================================
+# 9. Evaluation
+# ============================================================
+
+def evaluate_average_reward(agent, variant, data_dir, episodes=100, mode="testing"):
+    env = Environment(variant, data_dir)
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+
+    if mode == "testing":
+        max_eps = min(episodes, len(env.test_episodes))
+    elif mode == "validation":
+        max_eps = min(episodes, len(env.validation_episodes))
+    else:
+        max_eps = episodes
+
+    total = 0.0
+    for _ in range(max_eps):
+        obs = env.reset(mode)
+        s_vec = encode_obs(obs, env).reshape(1, -1)
+        done = 0
+        ep_ret = 0.0
+        steps = 0
+
+        while not done and steps < max_steps:
+            valid_actions = compute_valid_actions(env)
+            a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
+            r, nxt, done = env.step(a)
+            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            ep_ret += r
+            steps += 1
+
+        total += ep_ret
+
+    return total / float(max_eps)
+
+
+# ============================================================
+# 10. Main: run Variant 0
+# ============================================================
+
+if __name__ == "__main__":
+    VARIANT = 0
+    TRAIN_EPISODES_FULL = 800
+    VAL_EPISODES_FINAL = 100
+    TEST_EPISODES_FINAL = 100
+    NO_OF_ACTIONS = 5
+
+    # (optional) if you know greedy benchmark for v0, set here
+    GREEDY_BENCHMARK_V0 = 0.0
+
+    BASE_CONFIG = dict(
+        gamma=0.9389065584049,
+        epsilon=1.0,
+        batch_size=32,
+        epsilon_min=0.079088807071618797,
+        epsilon_decay=0.99,
+        units=128,
+        tau=0.0010323839507959762,
+        use_per=True,
+        per_alpha=0.4,
+        per_beta0=0.2,
+        per_beta1=1.0,
+        per_eps=1e-6,
+        per_beta_anneal_steps=200_000,
+        n_step=1,
+        use_noisy=True,
+        noisy_sigma0=0.12546649741233012,
+        use_distributional=False,
+
+        # Variant 0: smaller planner K recommended
+        planner_steps=4,
+
+        variant_name="variant0_run_exp1_duelingmap",
+    )
+
+    wd = os.getcwd()
+    save_folder = os.path.join(wd, 'save_folder_variant0_exp1_duelingmap')
+    os.makedirs(save_folder, exist_ok=True)
+
+    env_tmp = Environment(VARIANT, DATA_DIR)
+    obs0 = env_tmp.reset("training")
+    state_sample = encode_obs(obs0, env_tmp)
+    state_size = state_sample.shape[0]
+    print(f"Variant {VARIANT}: inferred state_size = {state_size}, action_size = {NO_OF_ACTIONS}")
+
+    agent = DQN_Agent(state_size, NO_OF_ACTIONS, BASE_CONFIG)
+
+    env_train = GymEnvironment(
+        env_id='env_variant0',
+        save_path=save_folder,
+        render=False,
+        variant=VARIANT,
+        data_dir=DATA_DIR,
+        pretty_render=False,
+        fps=8,
+        render_every=2
+    )
+
+    rew_train = env_train.trainDQN(agent, TRAIN_EPISODES_FULL)
+
+    avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=VAL_EPISODES_FINAL, mode="validation")
+    avg_test = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=TEST_EPISODES_FINAL, mode="testing")
+
+    print(f"[Variant {VARIANT}] Validation avg over {VAL_EPISODES_FINAL} episodes: {avg_val:.3f}")
+    print(f"[Variant {VARIANT}] Test       avg over {TEST_EPISODES_FINAL} episodes: {avg_test:.3f}")
+
+    plt.figure(figsize=(14, 6))
+    window = 25
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+
+    r = np.array(rew_train, dtype=np.float32)
+    x = np.arange(1, len(r) + 1)
+
+    raw_line, = plt.plot(x, r, alpha=0.20, label="Train (raw)")
+    if len(r) >= window:
+        mov = np.convolve(r, kernel, mode="valid")
+        xm = np.arange(window, len(r) + 1)
+        plt.plot(xm, mov, label="Train (25-ep avg)", color=raw_line.get_color())
+
+    plt.axhline(y=avg_val, linestyle=":", alpha=0.9, label=f"Val avg ({avg_val:.1f})")
+    plt.axhline(y=avg_test, linestyle="--", alpha=0.9, label=f"Test avg ({avg_test:.1f})")
+
+    if GREEDY_BENCHMARK_V0 != 0.0:
+        plt.axhline(
+            y=GREEDY_BENCHMARK_V0,
+            linestyle="-.",
+            color="black",
+            alpha=0.8,
+            label=f"Greedy benchmark ({GREEDY_BENCHMARK_V0:.2f})"
+        )
+
+    plt.title("Variant 0 – Double DQN (Noisy) + PER (fixed) + EXP1 ConvLSTM2D Planner + DUELING Q-MAP\n"
+              "800 Training, 100 Validation, 100 Testing")
+    plt.xlabel("Training episode")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+
+    out_plot = os.path.join(save_folder, "variant0_exp1_duelingmap_800_100_100.png")
+    plt.savefig(out_plot, dpi=150)
+    print(f"\nSaved plot to: {out_plot}")
+    plt.show()
