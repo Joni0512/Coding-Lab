@@ -1,10 +1,10 @@
-# ============================================================
+
 # Noisy Dueling Double-DQN with CNN (variant 0)
 # Best combo fixed: n_step=1, use_noisy=True, use_distributional=False
 # Bayesian optimization on classic hyperparameters + noisy_sigma0,
 # then final 800 train / 100 validation / 100 test,
 # with plot including greedy baseline and val/test averages.
-# ============================================================
+
 
 # ------------- Reproducibility / Quiet logs -----------------
 seed = 2
