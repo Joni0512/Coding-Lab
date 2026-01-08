@@ -1,5 +1,5 @@
 # ============================================================
-# Noisy Dueling Double-DQN with CNN (VARIANT 2)
+# Noisy Dueling Double-DQN with CNN (ENV VARIANT 1)
 # + EXPERIMENT 1: Masked ConvLSTM2D Planner
 # + FIX: Proper PER weights in loss, direct leaf indexing, in-place soft update
 #
@@ -232,15 +232,10 @@ def encode_obs(obs, env):
     state[:, :, 7] = step / float(env.episode_steps)
     state[:, :, 8] = agent_load / float(env.agent_capacity)
 
-    # ------------------------------
     # Φ plane (variant-1 aware, PPO-style)
-    # If carrying -> strong "go base" signal
-    # Else -> best item balancing distance + TTL
-    # ------------------------------
     phi_plane = np.zeros((H, W), dtype=np.float32)
 
     if agent_load > 0:
-        # go home bias (deposit)
         phi_plane = -1.2 * (env._dist_base_grid / max_dist)
     else:
         if len(item_locs) > 0:
@@ -294,10 +289,10 @@ class PrettyRenderer:
         ax.set_xticks([])
         ax.set_yticks([])
 
+        # Variant 1 has no holes; keep generic coloring
         for r in range(H):
             for c in range(W):
-                is_hole = (self.env.variant == 2) and ((r, c) not in self.env.eligible_cells)
-                col = (0.965, 0.965, 1.0) if not is_hole else (0.85, 0.85, 0.88)
+                col = (0.965, 0.965, 1.0)
                 ax.add_patch(Rectangle((c - 0.5, r - 0.5), 1, 1,
                                        facecolor=col, edgecolor="none", zorder=0))
 
@@ -366,7 +361,7 @@ def compute_valid_actions(env):
 # ============================================================
 
 class GymEnvironment:
-    def __init__(self, env_id, save_path, render=False, variant=2, data_dir="./data",
+    def __init__(self, env_id, save_path, render=False, variant=1, data_dir="./data",
                  pretty_render=False, fps=8, render_every=2):
         self.env = Environment(variant=variant, data_dir=data_dir)
         self.variant = variant
@@ -754,31 +749,28 @@ class DQN_Agent:
 
         self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
 
-    # ========================================================
-    # EXPERIMENT 1: ConvLSTM2D planner + TRUE DUELING MAP HEAD
-    # ========================================================
     def _build_model(self, state_size, action_size, units, old_model_path=""):
         K = int(self.planner_steps)
 
         inp = Input(shape=(state_size,))
         grid = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)
 
-        eligible_mask = Lambda(lambda x: x[:, :, :, 6:7], name="eligible_mask")(grid)  # [B,5,5,1]
-        agent_layer = Lambda(lambda x: x[:, :, :, 0:1], name="agent_layer")(grid)      # [B,5,5,1]
+        eligible_mask = Lambda(lambda x: x[:, :, :, 6:7], name="eligible_mask")(grid)
+        agent_layer = Lambda(lambda x: x[:, :, :, 0:1], name="agent_layer")(grid)
 
         x = Conv2D(32, kernel_size=3, padding="same", activation="relu")(grid)
         x = Conv2D(64, kernel_size=3, padding="same", activation="relu")(x)
 
-        x_plus = tf.keras.layers.Concatenate(axis=-1, name="feat_plus_mask")([x, eligible_mask])  # [B,5,5,65]
+        x_plus = tf.keras.layers.Concatenate(axis=-1, name="feat_plus_mask")([x, eligible_mask])
 
         def repeat_k(t):
             t = tf.expand_dims(t, axis=1)
             return tf.tile(t, [1, K, 1, 1, 1])
 
-        seq = Lambda(repeat_k, name="repeat_K")(x_plus)  # [B,K,5,5,65]
+        seq = Lambda(repeat_k, name="repeat_K")(x_plus)
 
-        seq_feat = Lambda(lambda t: t[:, :, :, :, :-1], name="seq_feat")(seq)   # [B,K,5,5,64]
-        seq_mask = Lambda(lambda t: t[:, :, :, :, -1:], name="seq_mask")(seq)   # [B,K,5,5,1]
+        seq_feat = Lambda(lambda t: t[:, :, :, :, :-1], name="seq_feat")(seq)
+        seq_mask = Lambda(lambda t: t[:, :, :, :, -1:], name="seq_mask")(seq)
 
         seq_feat = tf.keras.layers.Multiply(name="mask_feat_each_step")([seq_feat, seq_mask])
 
@@ -788,19 +780,16 @@ class DQN_Agent:
             padding="same",
             return_sequences=False,
             name="masked_convlstm_planner",
-        )(seq_feat)  # [B,5,5,64]
+        )(seq_feat)
 
         h_last = tf.keras.layers.Multiply(name="final_mask_apply")([h_last, eligible_mask])
 
-        # ---------------- TRUE DUELING MAP HEAD ----------------
         v_map = Conv2D(1, kernel_size=1, padding="same", name="v_map")(h_last)
         a_map = Conv2D(action_size, kernel_size=1, padding="same", name="a_map")(h_last)
 
         a_mean = Lambda(lambda a: tf.reduce_mean(a, axis=-1, keepdims=True), name="a_mean")(a_map)
         a_centered = tf.keras.layers.Subtract(name="a_centered")([a_map, a_mean])
-
         q_map = tf.keras.layers.Add(name="q_map")([v_map, a_centered])
-        # -------------------------------------------------------
 
         def gather_agent_q(args):
             qmap, agent = args
@@ -862,7 +851,7 @@ class DQN_Agent:
             model.load_weights(old_model_path)
         return model
 
-    # ---------------- SPEEDUP HERE ----------------
+    # SPEEDUP: no predict()
     def select_action(self, state, valid_actions=None, training=True):
         if valid_actions is None:
             valid_actions = np.arange(self.action_size, dtype=np.int32)
@@ -870,9 +859,8 @@ class DQN_Agent:
         if training and np.random.rand() < self.epsilon:
             return int(np.random.choice(valid_actions))
 
-        # direct forward pass (no predict overhead)
         if self.use_distributional:
-            dist = self.model(state, training=False).numpy()[0]  # (A, atoms) or (A,atoms) depending on model
+            dist = self.model(state, training=False).numpy()[0]
             q = np.sum(self.z * dist, axis=1)
         else:
             q = self.model(state, training=False).numpy()[0]
@@ -955,7 +943,7 @@ class DQN_Agent:
         td = Tgt - q_sa
         return loss, td
 
-    # ---------------- SPEEDUP HERE ----------------
+    # SPEEDUP: no predict()
     def update_weights(self):
         if len(self.memory) < self.learn_start:
             return
@@ -964,7 +952,6 @@ class DQN_Agent:
         valid_next_mask = self._valid_action_mask_from_states(NS)
 
         if not self.use_distributional:
-            # convert to tensors once; forward pass without predict()
             NS_tf = tf.convert_to_tensor(NS, dtype=tf.float32)
 
             q_next_online = self.model(NS_tf, training=False).numpy()
@@ -987,10 +974,6 @@ class DQN_Agent:
 
             if self.use_per:
                 self.memory.update_priorities(idxs, np.abs(td_errors))
-
-        else:
-            # (not used in your current run) keep as placeholder
-            pass
 
         self._soft_update_target()
         self.total_updates += 1
@@ -1037,12 +1020,12 @@ def evaluate_average_reward(agent, variant, data_dir, episodes=100, mode="testin
 def run_one(seed: int):
     set_global_seed(seed)
 
-    VARIANT = 2
+    VARIANT = 1
     TRAIN_EPISODES_FULL = 800
     VAL_EPISODES_FINAL = 100
     TEST_EPISODES_FINAL = 100
     NO_OF_ACTIONS = 5
-    GREEDY_BENCHMARK_V2 = 0.0
+    GREEDY_BENCHMARK_V1 = 0.0
 
     BASE_CONFIG = dict(
         gamma=0.9389065584049,
@@ -1066,11 +1049,11 @@ def run_one(seed: int):
         vmin=-200.0,
         vmax=200.0,
         planner_steps=8,
-        variant_name="variant2_run_exp1",
+        variant_name="variant1_run_exp1",
     )
 
     wd = os.getcwd()
-    save_folder = os.path.join(wd, f"save_folder_variant2_exp1_seed{seed}")
+    save_folder = os.path.join(wd, f"save_folder_variant1_exp1_seed{seed}")
     os.makedirs(save_folder, exist_ok=True)
 
     env_tmp = Environment(VARIANT, DATA_DIR)
@@ -1078,12 +1061,12 @@ def run_one(seed: int):
     state_sample = encode_obs(obs0, env_tmp)
     state_size = state_sample.shape[0]
 
-    print(f"Seed {seed} | Variant {VARIANT}: inferred state_size = {state_size}, action_size = {NO_OF_ACTIONS}")
+    print(f"Seed {seed} | Env Variant {VARIANT}: inferred state_size = {state_size}, action_size = {NO_OF_ACTIONS}")
 
     agent = DQN_Agent(state_size, NO_OF_ACTIONS, BASE_CONFIG)
 
     env_train = GymEnvironment(
-        env_id="env_variant2",
+        env_id="env_variant1",
         save_path=save_folder,
         render=False,
         variant=VARIANT,
@@ -1097,8 +1080,8 @@ def run_one(seed: int):
     avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=VAL_EPISODES_FINAL, mode="validation")
     avg_test = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=TEST_EPISODES_FINAL, mode="testing")
 
-    print(f"[Seed {seed} | Variant {VARIANT}] Validation avg over {VAL_EPISODES_FINAL} episodes: {avg_val:.3f}")
-    print(f"[Seed {seed} | Variant {VARIANT}] Test avg over {TEST_EPISODES_FINAL} episodes: {avg_test:.3f}")
+    print(f"[Seed {seed} | Env Variant {VARIANT}] Validation avg over {VAL_EPISODES_FINAL} episodes: {avg_val:.3f}")
+    print(f"[Seed {seed} | Env Variant {VARIANT}] Test avg over {TEST_EPISODES_FINAL} episodes: {avg_test:.3f}")
 
     plt.figure(figsize=(14, 6))
     window = 25
@@ -1115,17 +1098,17 @@ def run_one(seed: int):
     plt.axhline(y=avg_val, linestyle=":", alpha=0.9, label=f"Val avg ({avg_val:.1f})")
     plt.axhline(y=avg_test, linestyle="--", alpha=0.9, label=f"Test avg ({avg_test:.1f})")
 
-    if GREEDY_BENCHMARK_V2 != 0.0:
+    if GREEDY_BENCHMARK_V1 != 0.0:
         plt.axhline(
-            y=GREEDY_BENCHMARK_V2,
+            y=GREEDY_BENCHMARK_V1,
             linestyle="-.",
             color="black",
             alpha=0.8,
-            label=f"Greedy benchmark ({GREEDY_BENCHMARK_V2:.2f})",
+            label=f"Greedy benchmark ({GREEDY_BENCHMARK_V1:.2f})",
         )
 
     plt.title(
-        "Variant 2 – Double DQN + TRUE Dueling MAP head + PER (fixed) + EXP1 ConvLSTM2D Planner\n"
+        "Env Variant 1 – Double DQN + TRUE Dueling MAP head + PER (fixed) + EXP1 ConvLSTM2D Planner\n"
         "800 Training, 100 Validation, 100 Testing\n"
         "(Φ plane = variant-1-aware PPO-style + speedup: no predict())"
     )
@@ -1135,7 +1118,7 @@ def run_one(seed: int):
     plt.grid(alpha=0.3)
     plt.tight_layout()
 
-    out_plot = os.path.join(save_folder, f"variant2_exp1_800_100_100_seed{seed}.png")
+    out_plot = os.path.join(save_folder, f"variant1_exp1_800_100_100_seed{seed}.png")
     plt.savefig(out_plot, dpi=150)
     print(f"\nSaved plot to: {out_plot}")
     plt.show()
