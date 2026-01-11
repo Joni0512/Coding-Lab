@@ -1,1 +1,866 @@
+# ============================================================
+# Variant 0: Dueling Double-DQN + CNN + PER (CORRECT) + Potential Landscape Φ
+# - NO NOISY NET (use_noisy=False)
+# - Speed-ups:
+#   A1) no model.predict() (use direct TF calls)
+#   A2) in-place soft target update (no get_weights/set_weights)
+#   A3) cache max_dist once in _build_distance_structs (env._max_dist)
+# - PER fixes:
+#   B1) importance-sampling weights are used in loss (GradientTape)
+#   B2) PER leaf indexing (no slice-copy)
+# - Experiment: run n_step=1 and n_step=3 (each 800 train / 100 val / 100 test)
+# ============================================================
+
+# ------------- Reproducibility / Quiet logs -----------------
+seed = 2
+import os
+os.environ["PYTHONHASHSEED"] = str(seed)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import random
+random.seed(seed)
+
+import numpy as np
+np.random.seed(seed)
+
+import tensorflow as tf
+tf.random.set_seed(seed)
+
+# --- SciPy for shortest paths -------------------------------
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+# ============================================================
+# Environment import
+# ============================================================
+from environment import Environment
+
+# ============================================================
+# TF / Keras, plotting
+# ============================================================
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
+from tensorflow.keras.optimizers import Adam
+
+from collections import deque
+import warnings
+
+import matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+matplotlib.rcParams["font.family"] = "DejaVu Sans"
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+import matplotlib.pyplot as plt
+
+
+DATA_DIR = "./data"
+
+# ============================================================
+# 1) Distance structures (variant-aware, caches max_dist)
+# ============================================================
+
+def _build_distance_structs(env):
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+
+    variant = env.variant
+    H, W = 5, 5
+
+    if variant in (0, 1):
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_r, i_c = i // 5, i % 5
+                j_r, j_c = j // 5, j % 5
+                if (j_r - i_r == 0 and j_c - i_c == 1) or (j_r - i_r == 1 and j_c - i_c == 0):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    else:
+        # not needed for variant 0, but kept for completeness
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3),
+            (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1); link(1, 2); link(2, 3); link(3, 4)
+        link(3, 5); link(4, 6); link(5, 6); link(5, 10)
+        link(6, 11); link(7, 8); link(7, 12); link(8, 9)
+        link(9, 10); link(10, 11); link(12, 13); link(13, 14)
+        link(14, 15); link(15, 16); link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    env._dist_ready = True
+
+
+def _coord_to_idx(env, coord):
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    return env._coord_to_idx[coord]
+
+
+# ============================================================
+# 2) CNN observation encoding (+ Potential Landscape Φ as channel 9)
+# ============================================================
+
+HEIGHT = 5
+WIDTH  = 5
+CHANNELS = 10  # 0..8 original + 9 potential
+
+def _choose_goal_variant0(env, agent_loc, agent_load, item_locs, item_times):
+    """
+    Option B: goal = base if load full, else best feasible item by profit.
+    (profit approx = reward - [dist(agent->item) + dist(item->base)])
+    Feasible: dist(agent->item) <= max_response_time - age
+    """
+    # capacity in variant0 is 1, but keep general
+    if agent_load >= env.agent_capacity:
+        return env.target_loc
+
+    if not item_locs:
+        return env.target_loc  # "do something sane" when no items
+
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+
+    best_profit = -1e9
+    best_loc = env.target_loc
+
+    for loc, age in zip(item_locs, item_times):
+        r, c = loc
+        d_to_item = float(dist_agent_grid[r, c])
+        if d_to_item > (env.max_response_time - age):
+            continue  # can't reach in time
+
+        # total travel to complete: go to item then return to base
+        d_item_to_base = float(env._dist_base_grid[r, c])
+        total = d_to_item + d_item_to_base
+        profit = float(env.reward) - total
+
+        if profit > best_profit:
+            best_profit = profit
+            best_loc = loc
+
+    return best_loc
+
+
+def encode_obs(obs, env):
+    """
+    Returns flat vector length 5*5*10 = 250
+    Channel 9: Φ(c) = -dist(c, goal) / max_dist   (Option B landscape)
+    """
+    step, agent_loc, agent_load, item_locs, item_times = obs
+
+    _build_distance_structs(env)
+
+    H, W, C = HEIGHT, WIDTH, CHANNELS
+    state = np.zeros((H, W, C), dtype=np.float32)
+
+    # 6: eligible mask
+    eligible_set = set(env.eligible_cells)
+    for r in range(H):
+        for c in range(W):
+            state[r, c, 6] = 1.0 if (r, c) in eligible_set else 0.0
+
+    # 0: agent position
+    ar, ac = agent_loc
+    state[ar, ac, 0] = 1.0
+
+    # 1,2,5: items (presence, age norm, ttl norm)
+    for (loc, age) in zip(item_locs, item_times):
+        r, c = loc
+        state[r, c, 1] = 1.0
+        state[r, c, 2] = age / env.max_response_time
+        state[r, c, 5] = (env.max_response_time - age) / env.max_response_time
+
+    max_dist = getattr(env, "_max_dist", 1.0)
+    if max_dist <= 0:
+        max_dist = 1.0
+
+    # 3: distance agent->cell
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+    state[:, :, 3] = dist_agent_grid / max_dist
+
+    # 4: distance base->cell
+    state[:, :, 4] = env._dist_base_grid / max_dist
+
+    # 7: step norm
+    state[:, :, 7] = step / float(env.episode_steps)
+
+    # 8: load norm
+    state[:, :, 8] = agent_load / float(env.agent_capacity)
+
+    # 9: Φ potential landscape (Option B)
+    goal = _choose_goal_variant0(env, agent_loc, agent_load, item_locs, item_times)
+    goal_idx = _coord_to_idx(env, goal)
+    dist_goal_grid = env._dist_from_idx_grids[goal_idx]  # distance from goal to every cell
+
+    phi_plane = -(dist_goal_grid / max_dist)  # in [-max/max, 0] -> [-1, 0] typically
+    phi_plane = np.clip(phi_plane, -1.0, 0.0)
+    state[:, :, 9] = phi_plane
+
+    return state.reshape(-1)
+
+
+# ============================================================
+# 3) Action masking helper
+# ============================================================
+
+def compute_valid_actions(env):
+    valid = [0]  # idle always allowed
+    r, c = env.agent_loc
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    moves = [
+        (1, -1, 0),  # up
+        (2, 0, 1),   # right
+        (3, 1, 0),   # down
+        (4, 0, -1),  # left
+    ]
+    for act, dr, dc in moves:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < H and 0 <= nc < W and (nr, nc) in env.eligible_cells:
+            valid.append(act)
+
+    return np.array(valid, dtype=np.int32)
+
+
+# ============================================================
+# 4) Replay buffers (PER with leaf indexing)
+# ============================================================
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity <<= 1
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def total(self):
+        return self.tree[1]
+
+    def add(self, p: float, idx: int):
+        i = idx + self.capacity
+        delta = p - self.tree[i]
+        self.tree[i] = p
+        i //= 2
+        while i >= 1:
+            self.tree[i] += delta
+            i //= 2
+
+    def find_prefixsum_idx(self, mass: float) -> int:
+        i = 1
+        while i < self.capacity:
+            left = 2 * i
+            if self.tree[left] >= mass:
+                i = left
+            else:
+                mass -= self.tree[left]
+                i = left + 1
+        return i - self.capacity
+
+
+class PrioritizedReplayBuffer:
+    def __init__(self, state_dim, capacity=50_000, alpha=0.6, beta0=0.4,
+                 beta_final=1.0, beta_anneal_steps=200_000, eps=1e-6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.eps = eps
+        self.beta0 = beta0
+        self.beta_final = beta_final
+        self.beta_anneal_steps = max(1, beta_anneal_steps)
+
+        self.ptr = 0
+        self.n = 0
+
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+        self._beta_updates = 0
+
+    @property
+    def beta(self):
+        t = min(1.0, self._beta_updates / float(self.beta_anneal_steps))
+        return (1.0 - t) * self.beta0 + t * self.beta_final
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = a
+        self.rewards[i] = r
+        self.next_states[i] = ns
+        self.dones[i] = d
+
+        p = (self.max_priority + self.eps) ** self.alpha
+        self.sumtree.add(p, i)
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(mass)
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+        idxs = np.array(idxs, dtype=np.int32)
+
+        # ---- FIX: direct leaf indexing ----
+        leaf_idx = idxs + self.sumtree.capacity
+        p = self.sumtree.tree[leaf_idx]
+        p = np.clip(p, 1e-12, None)
+        P = p / max(1e-12, total)
+
+        self._beta_updates += 1
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            w.astype(np.float32),
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        prios = (np.abs(td_errors) + self.eps) ** self.alpha
+        self.max_priority = max(self.max_priority, float(np.max(prios)))
+        for i, p in zip(idxs, prios):
+            self.sumtree.add(float(p), int(i))
+
+
+# ============================================================
+# 5) GymEnvironment wrapper
+# ============================================================
+
+class GymEnvironment:
+    def __init__(self, save_path, variant=0, data_dir="./data"):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.variant = variant
+        self.max_timesteps = getattr(self.env, "episode_steps", 200)
+        self.save_path = save_path
+
+    def trainDQN(self, agent, no_episodes):
+        rew = self.runDQN(agent, no_episodes, training=True)
+        agent.model.save_weights(
+            os.path.join(self.save_path, f"dqn_variant{self.variant}_nstep{agent.n_step}.weights.h5"),
+            overwrite=True
+        )
+        return rew
+
+    def runDQN(self, agent, no_episodes, training=False):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+
+        for episode in range(no_episodes):
+            # keep your schedule
+            if training:
+                if episode < 400:
+                    update_every = 8
+                    per_update_steps = 1
+                else:
+                    update_every = 4
+                    per_update_steps = 1
+            else:
+                update_every = 4
+                per_update_steps = 1
+
+            mode = "training" if training else "validation"
+            obs = self.env.reset(mode=mode)
+            state_vec = encode_obs(obs, self.env).reshape(1, -1)
+
+            done = 0
+            rwd = 0.0
+            t = 0
+            step_since_update = 0
+
+            while not done and t < self.max_timesteps:
+                valid_actions = compute_valid_actions(self.env)
+                action = agent.select_action(state_vec, valid_actions=valid_actions, training=training)
+
+                reward, next_obs, done = self.env.step(action)
+                next_state_vec = encode_obs(next_obs, self.env).reshape(1, -1)
+                rwd += reward
+
+                truncated = (t + 1 >= self.max_timesteps)
+                terminal_flag = float(done or truncated)
+
+                if training:
+                    agent.record(state_vec, action, reward, next_state_vec, terminal_flag)
+                    step_since_update += 1
+                    if step_since_update % update_every == 0:
+                        for _ in range(per_update_steps):
+                            agent.update_weights()
+
+                state_vec = next_state_vec
+                t += 1
+                if truncated:
+                    break
+
+            rew[episode] = rwd
+
+            if training and (episode + 1) % 25 == 0:
+                start = max(0, episode + 1 - 25)
+                avg25 = float(np.mean(rew[start:episode + 1]))
+                print(f"[TRAIN n={agent.n_step}] Ep {episode + 1}/{no_episodes}  Return: {rwd:.1f}  |  Avg25: {avg25:.1f}")
+
+            if training:
+                agent.update_epsilon()
+
+        return rew
+
+
+# ============================================================
+# 6) DQN Agent (Dueling + Double, NO Noisy, PER correct)
+# ============================================================
+
+class DQN_Agent:
+    def __init__(self, state_size, no_of_actions, agent_hyperparameters=None):
+        if agent_hyperparameters is None:
+            agent_hyperparameters = {}
+
+        self.state_size = int(state_size)
+        self.action_size = int(no_of_actions)
+
+        # hparams (keep as you had them)
+        self.gamma = float(agent_hyperparameters.get("gamma", 0.99))
+        self.epsilon = float(agent_hyperparameters.get("epsilon", 1.0))
+        self.batch_size = int(agent_hyperparameters.get("batch_size", 32))
+        self.epsilon_min = float(agent_hyperparameters.get("epsilon_min", 0.05))
+        self.epsilon_decay = float(agent_hyperparameters.get("epsilon_decay", 0.995))
+        self.units = int(agent_hyperparameters.get("units", 64))
+
+        self.n_step = int(agent_hyperparameters.get("n_step", 1))
+        self.gamma_n = self.gamma ** self.n_step
+
+        self.tau = float(agent_hyperparameters.get("tau", 0.001))
+
+        # force NO noisy
+        self.use_noisy = False
+
+        # PER
+        self.use_per = bool(agent_hyperparameters.get("use_per", True))
+        per_alpha = float(agent_hyperparameters.get("per_alpha", 0.6))
+        per_beta0 = float(agent_hyperparameters.get("per_beta0", 0.4))
+        per_beta1 = float(agent_hyperparameters.get("per_beta1", 1.0))
+        per_eps = float(agent_hyperparameters.get("per_eps", 1e-6))
+        per_anneal = int(agent_hyperparameters.get("per_beta_anneal_steps", 200_000))
+
+        self.model = self._build_model(self.state_size, self.action_size, self.units)
+        self.target_model = self._build_model(self.state_size, self.action_size, self.units)
+        self.target_model.set_weights(self.model.get_weights())
+
+        self.memory = PrioritizedReplayBuffer(
+            state_dim=self.state_size,
+            capacity=50_000,
+            alpha=per_alpha,
+            beta0=per_beta0,
+            beta_final=per_beta1,
+            beta_anneal_steps=per_anneal,
+            eps=per_eps
+        )
+
+        # n-step buffer
+        self._n_step_buffer = deque(maxlen=self.n_step)
+
+        # IMPORTANT: n-step>1 needs earlier learning start (as you asked)
+        self.learn_start = max(2000, 5 * self.batch_size)
+
+        # weighted huber (PER correct)
+        self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+
+    def _build_model(self, state_size, action_size, units):
+        inp = Input(shape=(state_size,))
+        x = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)
+
+        x = Conv2D(32, kernel_size=3, padding="same", activation="relu")(x)
+        x = Conv2D(64, kernel_size=3, padding="same", activation="relu")(x)
+        x = Flatten()(x)
+        x = Dense(units, activation="relu")(x)
+
+        # dueling
+        adv = Dense(units, activation="relu")(x)
+        adv = Dense(action_size)(adv)
+
+        val = Dense(units, activation="relu")(x)
+        val = Dense(1)(val)
+
+        def combine_streams(tensors):
+            v, a = tensors
+            a_mean = tf.reduce_mean(a, axis=1, keepdims=True)
+            return v + (a - a_mean)
+
+        q = Lambda(combine_streams, name="dueling_combine")([val, adv])
+
+        model = Model(inputs=inp, outputs=q)
+        model.compile(optimizer=Adam(learning_rate=3e-4, clipnorm=10.0), loss="mse", run_eagerly=False)
+        return model
+
+    def select_action(self, state, valid_actions=None, training=True):
+        if valid_actions is None:
+            valid_actions = np.arange(self.action_size, dtype=np.int32)
+
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.choice(valid_actions))
+
+        # A1 speed-up: no predict()
+        q = self.model(tf.convert_to_tensor(state, dtype=tf.float32), training=False).numpy()[0]
+
+        masked_q = np.full_like(q, -1e9, dtype=np.float32)
+        masked_q[valid_actions] = q[valid_actions]
+        return int(np.argmax(masked_q))
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    # A2: in-place soft update
+    def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+        for src, tgt in zip(self.model.weights, self.target_model.weights):
+            tgt.assign(tau * src + one_minus * tgt)
+
+    def _valid_action_mask_from_states(self, states):
+        # states: [B, state_dim]
+        batch = states.shape[0]
+        grid = states.reshape(batch, HEIGHT, WIDTH, CHANNELS)
+
+        mask = np.zeros((batch, self.action_size), dtype=bool)
+        mask[:, 0] = True
+
+        agent_layer = grid[:, :, :, 0]  # one-hot
+        eligible_layer = grid[:, :, :, 6] > 0.5
+
+        # variant0: all eligible, but keep generic
+        for b in range(batch):
+            pos = np.argwhere(agent_layer[b] > 0.5)
+            if pos.size == 0:
+                continue
+            ar, ac = pos[0]
+            moves = [(1, -1, 0), (2, 0, 1), (3, 1, 0), (4, 0, -1)]
+            for act, dr, dc in moves:
+                nr, nc = ar + dr, ac + dc
+                if 0 <= nr < HEIGHT and 0 <= nc < WIDTH and eligible_layer[b, nr, nc]:
+                    mask[b, act] = True
+        return mask
+
+    def _add_single_transition(self, state, action, reward, next_state, done):
+        self.memory.add(
+            state.reshape(-1).astype(np.float32),
+            int(action),
+            float(reward),
+            next_state.reshape(-1).astype(np.float32),
+            float(done),
+        )
+
+    def record(self, state, action, reward, next_state, done):
+        if self.n_step <= 1:
+            self._add_single_transition(state, action, reward, next_state, done)
+            return
+
+        self._n_step_buffer.append((state, action, reward, next_state, done))
+
+        # flush when buffer full and not done
+        if len(self._n_step_buffer) == self.n_step and not done:
+            self._flush_n_step()
+            self._n_step_buffer.popleft()
+
+        # flush rest on terminal
+        if done:
+            while len(self._n_step_buffer) > 0:
+                self._flush_n_step()
+                self._n_step_buffer.popleft()
+
+    def _flush_n_step(self):
+        R = 0.0
+        gamma = 1.0
+        for (_, _, r, _, d) in self._n_step_buffer:
+            R += gamma * float(r)
+            gamma *= self.gamma
+            if d:
+                break
+
+        state_0, action_0, _, _, _ = self._n_step_buffer[0]
+        _, _, _, next_state_last, done_last = self._n_step_buffer[-1]
+        self._add_single_transition(state_0, action_0, R, next_state_last, done_last)
+
+    @tf.function
+    def _train_step_weighted_q(self, S, A, Tgt, is_w):
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)  # [B, A]
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)       # [B]
+            per_sample = self._huber_none(Tgt, q_sa)  # [B]
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
+    def update_weights(self):
+        if len(self.memory) < self.learn_start:
+            return
+
+        S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
+
+        # to TF
+        S_tf  = tf.convert_to_tensor(S, dtype=tf.float32)
+        NS_tf = tf.convert_to_tensor(NS, dtype=tf.float32)
+        A_tf  = tf.convert_to_tensor(A, dtype=tf.int32)
+        R_tf  = tf.convert_to_tensor(R, dtype=tf.float32)
+        D_tf  = tf.convert_to_tensor(D, dtype=tf.float32)
+        w_tf  = tf.convert_to_tensor(is_w, dtype=tf.float32)
+
+        valid_next_mask = self._valid_action_mask_from_states(NS)
+
+        # A1 speed-up: no predict()
+        q_next_online = self.model(NS_tf, training=False).numpy()
+        q_next_online[~valid_next_mask] = -1e9
+        best_next_actions = np.argmax(q_next_online, axis=1).astype(np.int32)
+
+        q_next_target = self.target_model(NS_tf, training=False).numpy()
+        q_next_target[~valid_next_mask] = -1e9
+        best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions].astype(np.float32)
+
+        best_next_q_tf = tf.convert_to_tensor(best_next_q, dtype=tf.float32)
+
+        Tgt_tf = R_tf + (self.gamma_n * best_next_q_tf * (1.0 - D_tf))
+
+        _, td_tf = self._train_step_weighted_q(S_tf, A_tf, Tgt_tf, w_tf)
+
+        td_errors = tf.abs(td_tf).numpy()
+        self.memory.update_priorities(idxs, td_errors)
+
+        self._soft_update_target()
+
+
+# ============================================================
+# 7) Evaluation
+# ============================================================
+
+def evaluate_average_reward(agent, variant, data_dir, episodes=100, mode="testing"):
+    env = Environment(variant, data_dir)
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+
+    if mode == "testing":
+        max_eps = min(episodes, len(env.test_episodes))
+    elif mode == "validation":
+        max_eps = min(episodes, len(env.validation_episodes))
+    else:
+        max_eps = episodes
+
+    total = 0.0
+    for _ in range(max_eps):
+        obs = env.reset(mode)
+        s_vec = encode_obs(obs, env).reshape(1, -1)
+        done = 0
+        ep_ret = 0.0
+        steps = 0
+
+        while not done and steps < max_steps:
+            valid_actions = compute_valid_actions(env)
+            a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
+            r, nxt, done = env.step(a)
+            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            ep_ret += r
+            steps += 1
+
+        total += ep_ret
+
+    return total / float(max_eps)
+
+
+# ============================================================
+# 8) Main: run n_step=1 and n_step=3 (each 800/100/100) + plot
+# ============================================================
+
+if __name__ == "__main__":
+    VARIANT = 0
+    TRAIN_EPISODES = 800
+    VAL_EPISODES = 100
+    TEST_EPISODES = 100
+    NO_OF_ACTIONS = 5
+
+    GREEDY_BENCHMARK_V0 = 221.77
+
+    # Keep your "best combo" params, ONLY noisy off (implicitly) and we run n_step in loop
+    BASE_CONFIG = dict(
+        gamma=0.9389065584049,
+        epsilon=1.0,
+        batch_size=32,
+        epsilon_min=0.079088807071618797,
+        epsilon_decay=0.99,
+        units=128,
+        tau=0.0010323839507959762,
+
+        use_per=True,
+        per_alpha=0.4,
+        per_beta0=0.2,
+        per_beta1=1.0,
+        per_eps=1e-6,
+        per_beta_anneal_steps=200_000,
+    )
+
+    wd = os.getcwd()
+    save_folder = os.path.join(wd, "save_folder_variant0_phi_nstep_compare")
+    os.makedirs(save_folder, exist_ok=True)
+
+    # infer state size (with Φ channel)
+    env_tmp = Environment(VARIANT, DATA_DIR)
+    obs0 = env_tmp.reset("training")
+    state_sample = encode_obs(obs0, env_tmp)
+    state_size = int(state_sample.shape[0])
+    print(f"Variant {VARIANT}: state_size={state_size}, action_size={NO_OF_ACTIONS}")
+
+    results = []
+
+    for n_step in [1, 3]:
+        print("\n" + "=" * 70)
+        print(f"RUN: n_step = {n_step}  (Noisy OFF)  + Φ landscape")
+        print("=" * 70)
+
+        cfg = dict(BASE_CONFIG)
+        cfg["n_step"] = n_step
+
+        agent = DQN_Agent(state_size, NO_OF_ACTIONS, cfg)
+        env_train = GymEnvironment(save_path=save_folder, variant=VARIANT, data_dir=DATA_DIR)
+
+        rew_train = env_train.trainDQN(agent, TRAIN_EPISODES)
+
+        avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=VAL_EPISODES, mode="validation")
+        avg_test = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=TEST_EPISODES, mode="testing")
+
+        print(f"[n_step={n_step}] Validation avg ({VAL_EPISODES} eps): {avg_val:.3f}")
+        print(f"[n_step={n_step}] Test       avg ({TEST_EPISODES} eps): {avg_test:.3f}")
+
+        results.append(
+            dict(
+                name=f"n_step={n_step}",
+                n_step=n_step,
+                config=cfg,
+                train_rewards=np.array(rew_train, dtype=np.float32),
+                val_mean=float(avg_val),
+                test_mean=float(avg_test),
+            )
+        )
+
+    # ---------------- Plot ----------------
+    plt.figure(figsize=(14, 6))
+    window = 25
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+
+    for res in results:
+        r = res["train_rewards"]
+        x = np.arange(1, len(r) + 1)
+
+        raw_line, = plt.plot(x, r, alpha=0.18, label=f"{res['name']} – Train (raw)")
+        color = raw_line.get_color()
+
+        if len(r) >= window:
+            mov = np.convolve(r, kernel, mode="valid")
+            xm = np.arange(window, len(r) + 1)
+            plt.plot(xm, mov, color=color, label=f"{res['name']} – Train (25-ep avg)")
+
+        plt.axhline(y=res["val_mean"], linestyle=":", color=color, alpha=0.95,
+                    label=f"{res['name']} – Val avg ({res['val_mean']:.1f})")
+        plt.axhline(y=res["test_mean"], linestyle="--", color=color, alpha=0.95,
+                    label=f"{res['name']} – Test avg ({res['test_mean']:.1f})")
+
+    plt.axhline(y=GREEDY_BENCHMARK_V0, linestyle="-.", color="black", alpha=0.85,
+                label=f"Greedy benchmark ({GREEDY_BENCHMARK_V0:.2f})")
+
+    plt.title("Variant 0 – Dueling Double-DQN + CNN + PER(correct) + Φ landscape\n"
+              "Compare n_step=1 vs n_step=3 (Noisy OFF) | 800 train / 100 val / 100 test")
+    plt.xlabel("Training episode")
+    plt.ylabel("Reward")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_plot = os.path.join(save_folder, "variant0_phi_nstep_1_vs_3.png")
+    plt.savefig(out_plot, dpi=150)
+    print(f"\nSaved plot to: {out_plot}")
+    plt.show()
+
+    # quick summary print
+    print("\n=== SUMMARY ===")
+    for res in results:
+        print(f"{res['name']}: Val {res['val_mean']:.3f} | Test {res['test_mean']:.3f}")
 
