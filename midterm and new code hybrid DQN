@@ -1,0 +1,930 @@
+# ============================================================
+# HYBRID VARIANT-0 DQN (SINGLE FILE)
+# ✔ Dense-Dueling Double-DQN
+# ✔ Φ deliverability (10th channel)
+# ✔ FAST action masking via lookup tables
+# ✔ PER buffer = 50k (with importance weights)
+# ✔ Optional Spike-Boost (safe: warmup + mild factor + only "delivery")
+# ✔ Unique Val/Test episodes (no repeats) + overlap checks
+# ✔ Avg25 logging + optional Top-K checkpointing by quick-val
+#
+# NOTE:
+# - This script includes a patched Environment (unique val/test).
+# - It is intended for variant 0 (full 5x5 grid).
+# ============================================================
+
+import os
+import random
+from copy import deepcopy
+from itertools import compress
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+import matplotlib.pyplot as plt
+
+# ---------------------- Reproducibility ----------------------
+SEED = 6
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# Optional GPU memory growth
+try:
+    gpus = tf.config.list_physical_devices("GPU")
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+except Exception:
+    pass
+
+
+# ============================================================
+# PATCHED Environment (unique validation/test episodes)
+# ============================================================
+
+class Environment(object):
+    def __init__(self, variant, data_dir):
+        self.variant = int(variant)
+        self.vertical_cell_count = 5
+        self.horizontal_cell_count = 5
+        self.vertical_idx_target = 2
+        self.horizontal_idx_target = 0
+        self.target_loc = (self.vertical_idx_target, self.horizontal_idx_target)
+        self.episode_steps = 200
+        self.max_response_time = 15 if self.variant == 2 else 10
+        self.reward = 25 if self.variant == 2 else 15
+
+        if not os.path.isabs(data_dir):
+            data_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), data_dir))
+        self.data_dir = data_dir
+        self._base = os.path.join(self.data_dir, f"variant_{self.variant}")
+
+        self.training_episodes = pd.read_csv(os.path.join(self._base, "training_episodes.csv")).training_episodes.tolist()
+        self.validation_episodes = pd.read_csv(os.path.join(self._base, "validation_episodes.csv")).validation_episodes.tolist()
+        self.test_episodes = pd.read_csv(os.path.join(self._base, "test_episodes.csv")).test_episodes.tolist()
+
+        # Unique, no replacement
+        self.remaining_training_episodes = deepcopy(self.training_episodes)
+        self.remaining_validation_episodes = deepcopy(self.validation_episodes)
+        self.remaining_test_episodes = deepcopy(self.test_episodes)
+
+        self.agent_capacity = 1 if self.variant in (0, 2) else 3
+
+        if self.variant in (0, 1):
+            self.eligible_cells = [(r, c) for r in range(5) for c in range(5)]
+        else:
+            self.eligible_cells = [
+                (0, 0),        (0, 2), (0, 3), (0, 4),
+                (1, 0),        (1, 2),        (1, 4),
+                (2, 0),        (2, 2),        (2, 4),
+                (3, 0), (3, 1), (3, 2),        (3, 4),
+                (4, 0), (4, 1), (4, 2),        (4, 4)
+            ]
+
+        ep_dir = os.path.join(self._base, "episode_data")
+        files = [f for f in os.listdir(ep_dir) if f.startswith("episode_") and f.endswith(".csv")]
+        if not files:
+            raise FileNotFoundError(f"No episode files found in {ep_dir}")
+
+        def _parse_num(fname: str) -> int:
+            core = fname[len("episode_"):-4]
+            return int(core)
+
+        self._available_ids = sorted(_parse_num(f) for f in files)
+        self._available_set = set(self._available_ids)
+        self._ep_min = min(self._available_ids)
+
+        self.last_episode_list_id = None
+        self.last_episode_file_id = None
+
+        # runtime state
+        self.step_count = 0
+        self.agent_loc = self.target_loc
+        self.agent_load = 0
+        self.item_locs = []
+        self.item_times = []
+
+    def reset(self, mode: str):
+        modes = ["training", "validation", "testing"]
+        if mode not in modes:
+            raise ValueError(f"Invalid mode. Expected one of: {modes}")
+
+        self.step_count = 0
+        self.agent_loc = (self.vertical_idx_target, self.horizontal_idx_target)
+        self.agent_load = 0
+        self.item_locs = []
+        self.item_times = []
+
+        if mode == "testing":
+            if not self.remaining_test_episodes:
+                self.remaining_test_episodes = deepcopy(self.test_episodes)
+            episode = self.remaining_test_episodes.pop(0)
+        elif mode == "validation":
+            if not self.remaining_validation_episodes:
+                self.remaining_validation_episodes = deepcopy(self.validation_episodes)
+            episode = self.remaining_validation_episodes.pop(0)
+        else:
+            if not self.remaining_training_episodes:
+                self.remaining_training_episodes = deepcopy(self.training_episodes)
+            episode = random.choice(self.remaining_training_episodes)
+            self.remaining_training_episodes.remove(episode)
+
+        file_id = episode if episode in self._available_set else episode + self._ep_min
+
+        self.last_episode_list_id = episode
+        self.last_episode_file_id = file_id
+
+        ep_dir = os.path.join(self._base, "episode_data")
+        cand1 = os.path.join(ep_dir, f"episode_{file_id}.csv")
+        cand2 = os.path.join(ep_dir, f"episode_{file_id:03d}.csv")
+        if os.path.exists(cand1):
+            ep_path = cand1
+        elif os.path.exists(cand2):
+            ep_path = cand2
+        else:
+            raise FileNotFoundError(
+                f"Episode file not found for id {file_id}. Tried:\n  {cand1}\n  {cand2}\n"
+                f"Available ids (min..max): {self._available_ids[0]}..{self._available_ids[-1]}"
+            )
+
+        self.data = pd.read_csv(ep_path, index_col=0)
+        return self.get_obs()
+
+    def step(self, act: int):
+        self.step_count += 1
+        rew = 0.0
+        done = 1 if self.step_count == self.episode_steps else 0
+
+        if act != 0:
+            if act == 1:
+                new_loc = (self.agent_loc[0] - 1, self.agent_loc[1])
+            elif act == 2:
+                new_loc = (self.agent_loc[0], self.agent_loc[1] + 1)
+            elif act == 3:
+                new_loc = (self.agent_loc[0] + 1, self.agent_loc[1])
+            elif act == 4:
+                new_loc = (self.agent_loc[0], self.agent_loc[1] - 1)
+            else:
+                new_loc = self.agent_loc
+
+            if new_loc in self.eligible_cells:
+                self.agent_loc = new_loc
+                rew += -1.0
+
+        # pickup
+        if (self.agent_load < self.agent_capacity) and (self.agent_loc in self.item_locs):
+            self.agent_load += 1
+            idx = self.item_locs.index(self.agent_loc)
+            self.item_locs.pop(idx)
+            self.item_times.pop(idx)
+            rew += self.reward / 2.0
+
+        # deliver (drop at base)
+        if self.agent_loc == self.target_loc and self.agent_load > 0:
+            rew += self.agent_load * self.reward / 2.0
+            self.agent_load = 0
+
+        # time update + expiration
+        self.item_times = [t + 1 for t in self.item_times]
+        mask = [t < self.max_response_time for t in self.item_times]
+        self.item_locs = list(compress(self.item_locs, mask))
+        self.item_times = list(compress(self.item_times, mask))
+
+        # spawn new items
+        new_items_df = self.data[self.data.step == self.step_count]
+        new_items = list(zip(new_items_df.vertical_idx, new_items_df.horizontal_idx))
+        new_items = [loc for loc in new_items if loc not in self.item_locs]
+        self.item_locs += new_items
+        self.item_times += [0] * len(new_items)
+
+        return float(rew), self.get_obs(), int(done)
+
+    def get_obs(self):
+        return (self.step_count, self.agent_loc, self.agent_load, tuple(self.item_locs), tuple(self.item_times))
+
+
+# ============================================================
+# FAST v0 action masking lookup
+# ============================================================
+
+HEIGHT, WIDTH = 5, 5
+CHANNELS = 10
+ACTIONS = 5
+
+VALID_ACTS_BY_CELL = []
+VALID_MASK_BY_CELL = np.zeros((25, ACTIONS), dtype=bool)
+for r in range(5):
+    for c in range(5):
+        v = [0]
+        if r > 0: v.append(1)
+        if c < 4: v.append(2)
+        if r < 4: v.append(3)
+        if c > 0: v.append(4)
+        v = np.array(v, dtype=np.int32)
+        VALID_ACTS_BY_CELL.append(v)
+        VALID_MASK_BY_CELL[r * 5 + c, v] = True
+
+MAX_POSSIBLE_SUM_DIST_V0 = 14.0
+
+
+# ============================================================
+# Distances (precompute once per env)
+# ============================================================
+
+def _build_distance_structs(env: Environment):
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+    if env.variant not in (0, 1):
+        raise RuntimeError("This hybrid script is intended for variant 0/1 full-grid logic (v0 target).")
+
+    neighbor_matrix = np.zeros((25, 25), dtype=int)
+    for i in range(25):
+        r, c = i // 5, i % 5
+        if r > 0: neighbor_matrix[i, i - 5] = 1
+        if r < 4: neighbor_matrix[i, i + 5] = 1
+        if c > 0: neighbor_matrix[i, i - 1] = 1
+        if c < 4: neighbor_matrix[i, i + 1] = 1
+
+    graph = csr_matrix(neighbor_matrix)
+    dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+    env._dist_matrix = dist_matrix
+    dist_grids = []
+    for idx in range(25):
+        dist_grids.append(dist_matrix[idx].reshape(5, 5).astype(np.float32))
+    env._dist_from_idx_grids = dist_grids
+
+    base_idx = env.vertical_idx_target * 5 + env.horizontal_idx_target
+    env._dist_base_grid = dist_grids[base_idx]
+
+    finite = dist_matrix[dist_matrix < np.inf]
+    env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+    if env._max_dist <= 0:
+        env._max_dist = 1.0
+
+    env._dist_ready = True
+
+
+# ============================================================
+# Encoding with Φ (deliverability score)
+# ============================================================
+
+def encode_obs(obs, env: Environment) -> np.ndarray:
+    step, agent_loc, agent_load, item_locs, item_times = obs
+    _build_distance_structs(env)
+
+    state = np.zeros((5, 5, 10), dtype=np.float32)
+
+    # channel 6: eligible (v0 all 1)
+    state[:, :, 6] = 1.0
+
+    # channel 0: agent one-hot
+    ar, ac = agent_loc
+    state[ar, ac, 0] = 1.0
+
+    agent_idx = ar * 5 + ac
+    dist_agent = env._dist_from_idx_grids[agent_idx]
+    dist_base = env._dist_base_grid
+    max_dist = float(env._max_dist)
+
+    # channels: distances
+    state[:, :, 3] = dist_agent / max_dist
+    state[:, :, 4] = dist_base / max_dist
+
+    # channels: step, load
+    state[:, :, 7] = step / float(env.episode_steps)
+    state[:, :, 8] = agent_load / float(env.agent_capacity)
+
+    # item channels + Φ
+    if len(item_locs) > 0:
+        locs = np.array(item_locs, dtype=np.int32)
+        ages = np.array(item_times, dtype=np.float32)
+        rr = locs[:, 0]
+        cc = locs[:, 1]
+
+        ttl_norm = (float(env.max_response_time) - ages) / float(env.max_response_time)
+        age_norm = ages / float(env.max_response_time)
+
+        state[rr, cc, 1] = 1.0
+        state[rr, cc, 2] = age_norm
+        state[rr, cc, 5] = ttl_norm
+
+        dsum_items = (dist_agent[rr, cc] + dist_base[rr, cc]).astype(np.float32)
+        score_items = ttl_norm - (dsum_items / MAX_POSSIBLE_SUM_DIST_V0)
+        best_ttl = float(ttl_norm[np.argmax(score_items)])
+
+        dsum_plane = (dist_agent + dist_base).astype(np.float32)
+        phi_plane = best_ttl - (dsum_plane / MAX_POSSIBLE_SUM_DIST_V0)
+        state[:, :, 9] = np.clip(phi_plane, -1.0, 1.0)
+
+    return state.reshape(-1)
+
+
+# ============================================================
+# PER (50k) with SumTree + importance weights
+# ============================================================
+
+class SumTree:
+    def __init__(self, capacity: int):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity <<= 1
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def total(self) -> float:
+        return float(self.tree[1])
+
+    def add(self, p: float, idx: int):
+        i = idx + self.capacity
+        delta = p - self.tree[i]
+        self.tree[i] = p
+        i //= 2
+        while i >= 1:
+            self.tree[i] += delta
+            i //= 2
+
+    def find_prefixsum_idx(self, mass: float) -> int:
+        i = 1
+        while i < self.capacity:
+            left = 2 * i
+            if self.tree[left] >= mass:
+                i = left
+            else:
+                mass -= self.tree[left]
+                i = left + 1
+        return i - self.capacity
+
+
+class PrioritizedReplayBuffer:
+    def __init__(
+        self,
+        state_dim: int,
+        capacity: int = 50_000,
+        alpha: float = 0.6,
+        beta0: float = 0.4,
+        beta_final: float = 1.0,
+        beta_anneal_steps: int = 200_000,
+        eps: float = 1e-6
+    ):
+        self.capacity = int(capacity)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+
+        self.beta0 = float(beta0)
+        self.beta_final = float(beta_final)
+        self.beta_anneal_steps = max(1, int(beta_anneal_steps))
+        self._beta_updates = 0
+
+        self.ptr = 0
+        self.n = 0
+
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+
+    @property
+    def beta(self) -> float:
+        t = min(1.0, self._beta_updates / float(self.beta_anneal_steps))
+        return (1.0 - t) * self.beta0 + t * self.beta_final
+
+    def __len__(self) -> int:
+        return int(self.n)
+
+    def add(self, s, a, r, ns, d, priority_boost: float = 1.0):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = int(a)
+        self.rewards[i] = float(r)
+        self.next_states[i] = ns
+        self.dones[i] = float(d)
+
+        base = self.max_priority * float(priority_boost)
+        p = (base + self.eps) ** self.alpha
+        self.sumtree.add(float(p), int(i))
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size: int):
+        batch_size = int(batch_size)
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(float(mass))
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+        idxs = np.array(idxs, dtype=np.int32)
+
+        leaf_idx = idxs + self.sumtree.capacity
+        p = self.sumtree.tree[leaf_idx]
+        p = np.clip(p, 1e-12, None)
+        P = p / max(1e-12, total)
+
+        self._beta_updates += 1
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            w.astype(np.float32)
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        prios = (np.abs(td_errors) + self.eps) ** self.alpha
+        self.max_priority = max(self.max_priority, float(np.max(prios)))
+        for i, p in zip(idxs, prios):
+            self.sumtree.add(float(p), int(i))
+
+
+# ============================================================
+# Top-K checkpoint helper
+# ============================================================
+
+class TopKCheckpoints:
+    def __init__(self, enabled: bool, save_dir: str, k: int = 5):
+        self.enabled = bool(enabled)
+        self.save_dir = save_dir
+        self.k = int(k)
+        self.cands = []  # list of (val_quick, path)
+
+    def maybe_save(self, agent, ep: int, val_quick: float):
+        if not self.enabled:
+            return
+        os.makedirs(self.save_dir, exist_ok=True)
+        path = os.path.join(self.save_dir, f"ckpt_ep{ep:04d}_valq{val_quick:.1f}.weights.h5")
+        agent.model.save_weights(path, overwrite=True)
+        self.cands.append((float(val_quick), path))
+        self.cands = sorted(self.cands, key=lambda x: x[0], reverse=True)[:self.k]
+
+    def select_best_full(self, agent, eval_full_fn):
+        if not self.enabled or not self.cands:
+            return None
+        best_val, best_path = -1e18, None
+        for vq, path in self.cands:
+            agent.model.load_weights(path)
+            agent.target_model.set_weights(agent.model.get_weights())
+            v = float(eval_full_fn())
+            if v > best_val:
+                best_val, best_path = v, path
+        agent.model.load_weights(best_path)
+        agent.target_model.set_weights(agent.model.get_weights())
+        return best_val, best_path
+
+
+# ============================================================
+# Dense Dueling Double-DQN Agent (NO Noisy)
+# ============================================================
+
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
+from tensorflow.keras.optimizers import Adam
+
+class DQNAgent:
+    def __init__(self, state_size: int, action_size: int, cfg: dict):
+        self.state_size = int(state_size)
+        self.action_size = int(action_size)
+
+        self.gamma = float(cfg.get("gamma", 0.97))
+        self.epsilon = float(cfg.get("epsilon", 1.0))
+        self.epsilon_min = float(cfg.get("epsilon_min", 0.02))
+        self.epsilon_decay = float(cfg.get("epsilon_decay", 0.995))
+        self.batch_size = int(cfg.get("batch_size", 64))
+        self.units = int(cfg.get("units", 256))
+        self.tau = float(cfg.get("tau", 0.005))
+
+        # Spike boost (optional)
+        self.use_spike_boost = bool(cfg.get("use_spike_boost", False))
+        self.spike_boost_factor = float(cfg.get("spike_boost_factor", 1.5))
+        self.spike_boost_warmup_steps = int(cfg.get("spike_boost_warmup_steps", 20_000))
+
+        # PER
+        self.memory = PrioritizedReplayBuffer(
+            state_dim=self.state_size,
+            capacity=int(cfg.get("replay_capacity", 50_000)),
+            alpha=float(cfg.get("per_alpha", 0.6)),
+            beta0=float(cfg.get("per_beta0", 0.4)),
+            beta_final=float(cfg.get("per_beta1", 1.0)),
+            beta_anneal_steps=int(cfg.get("per_beta_anneal_steps", 200_000)),
+            eps=float(cfg.get("per_eps", 1e-6)),
+        )
+
+        self.learn_start = int(cfg.get("learn_start", max(5000, 5 * self.batch_size)))
+        self.total_env_steps = 0
+
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.target_model.set_weights(self.model.get_weights())
+
+        # weighted per-sample huber (Reduction.NONE)
+        self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+
+    def _build_model(self) -> Model:
+        inp = Input(shape=(self.state_size,))
+        x = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)
+
+        x = Conv2D(32, 3, padding="same", activation="relu")(x)
+        x = Conv2D(64, 3, padding="same", activation="relu")(x)
+        x = Flatten()(x)
+        x = Dense(self.units, activation="relu")(x)
+
+        adv = Dense(self.units, activation="relu")(x)
+        adv = Dense(self.action_size)(adv)
+
+        val = Dense(self.units, activation="relu")(x)
+        val = Dense(1)(val)
+
+        def combine(v_a):
+            v, a = v_a
+            a_mean = tf.reduce_mean(a, axis=1, keepdims=True)
+            return v + (a - a_mean)
+
+        q = Lambda(combine)([val, adv])
+
+        m = Model(inputs=inp, outputs=q)
+        m.compile(optimizer=Adam(learning_rate=3e-4, clipnorm=10.0), loss=tf.keras.losses.Huber(delta=1.0))
+        return m
+
+    def select_action(self, state_vec_1x: np.ndarray, valid_actions: np.ndarray, training: bool = True) -> int:
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.choice(valid_actions))
+        q = self.model(state_vec_1x, training=False).numpy()[0]  # (A,)
+        masked_q = np.full_like(q, -1e9, dtype=np.float32)
+        masked_q[valid_actions] = q[valid_actions]
+        return int(np.argmax(masked_q))
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+        for src, tgt in zip(self.model.weights, self.target_model.weights):
+            tgt.assign(tau * src + one_minus * tgt)
+
+    @tf.function
+    def _train_step_weighted(self, S, A, Tgt, is_w):
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)  # (B, A)
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)  # (B,)
+            per_sample = self._huber_none(Tgt, q_sa)  # (B,)
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
+    def update_weights(self, per_update_steps: int = 1):
+        if len(self.memory) < self.learn_start:
+            return
+
+        for _ in range(int(per_update_steps)):
+            S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
+
+            # FAST valid-action mask for NEXT state based on agent channel in NS
+            grid = NS.reshape(self.batch_size, 5, 5, CHANNELS)
+            agent_flat = grid[:, :, :, 0].reshape(self.batch_size, 25)
+            idx_flat = agent_flat.argmax(axis=1)
+            valid_next_mask = VALID_MASK_BY_CELL[idx_flat]  # (B, A)
+
+            NS_tf = tf.convert_to_tensor(NS, dtype=tf.float32)
+
+            q_next_online = self.model(NS_tf, training=False).numpy()
+            q_next_online[~valid_next_mask] = -1e9
+            best_next_actions = np.argmax(q_next_online, axis=1)
+
+            q_next_target = self.target_model(NS_tf, training=False).numpy()
+            q_next_target[~valid_next_mask] = -1e9
+            best_next_q = q_next_target[np.arange(self.batch_size), best_next_actions]
+
+            tgt_np = R + self.gamma * best_next_q * (1.0 - D)
+
+            S_tf = tf.convert_to_tensor(S, dtype=tf.float32)
+            A_tf = tf.convert_to_tensor(A, dtype=tf.int32)
+            Tgt_tf = tf.convert_to_tensor(tgt_np, dtype=tf.float32)
+            w_tf = tf.convert_to_tensor(is_w, dtype=tf.float32)
+
+            _, td_tf = self._train_step_weighted(S_tf, A_tf, Tgt_tf, w_tf)
+            td_errors = td_tf.numpy()
+
+            self.memory.update_priorities(idxs, np.abs(td_errors))
+            self._soft_update_target()
+
+
+# ============================================================
+# Evaluation helpers (unique episodes guaranteed by env.reset)
+# ============================================================
+
+def check_val_test_overlap(variant: int, data_dir: str):
+    env = Environment(variant, data_dir)
+    val_set = set(env.validation_episodes)
+    test_set = set(env.test_episodes)
+    print("VAL size:", len(val_set))
+    print("TEST size:", len(test_set))
+    print("overlap(list ids):", len(val_set & test_set))
+
+    def to_file_id(ep):
+        return ep if ep in env._available_set else ep + env._ep_min
+
+    val_files = set(map(to_file_id, env.validation_episodes))
+    test_files = set(map(to_file_id, env.test_episodes))
+    print("overlap(file ids):", len(val_files & test_files))
+
+
+def verify_eval_unique(variant: int, data_dir: str, mode: str, expected_count: int = 100):
+    env = Environment(variant, data_dir)
+    seen_file = []
+    for _ in range(expected_count):
+        env.reset(mode)
+        seen_file.append(env.last_episode_file_id)
+    print(f"[VERIFY {mode.upper()}] requested={expected_count} | unique_file_ids={len(set(seen_file))}")
+
+
+def evaluate_average_reward(agent: DQNAgent, variant: int, data_dir: str, episodes: int = 100, mode: str = "testing") -> float:
+    env = Environment(variant, data_dir)
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+
+    total = 0.0
+    seen = []
+    for _ in range(episodes):
+        obs = env.reset(mode)
+        seen.append(env.last_episode_file_id)
+
+        s_vec = encode_obs(obs, env).reshape(1, -1)
+        done = 0
+        ep_ret = 0.0
+        steps = 0
+
+        while not done and steps < max_steps:
+            ar, ac = env.agent_loc
+            valid_actions = VALID_ACTS_BY_CELL[ar * 5 + ac]
+            a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
+            r, nxt, done = env.step(a)
+            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            ep_ret += r
+            steps += 1
+
+        total += ep_ret
+
+    print(f"[{mode.upper()}] ran={episodes} unique_file_ids={len(set(seen))}")
+    return total / float(episodes)
+
+
+# ============================================================
+# Trainer (avg25 + optional spike boost + optional top-k ckpt)
+# ============================================================
+
+class Trainer:
+    def __init__(self, save_path: str, variant: int = 0, data_dir: str = "./data"):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.variant = variant
+        self.max_timesteps = int(getattr(self.env, "episode_steps", 200))
+        self.save_path = save_path
+        os.makedirs(self.save_path, exist_ok=True)
+
+    def train(
+        self,
+        agent: DQNAgent,
+        no_episodes: int,
+        update_schedule: str = "late_turbo",  # "fixed" or "late_turbo"
+        use_ckpt_topk: bool = True,
+        ckpt_every: int = 50,
+        val_quick_episodes: int = 20,
+        ckpt_topk: int = 5
+    ):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+        ckpt = TopKCheckpoints(use_ckpt_topk, self.save_path, k=ckpt_topk)
+
+        for episode in range(no_episodes):
+            # update schedule (fast but stable)
+            if update_schedule == "late_turbo":
+                if episode < 200:
+                    update_every = 12
+                    per_update_steps = 1
+                elif episode < 450:
+                    update_every = 8
+                    per_update_steps = 2
+                else:
+                    update_every = 4
+                    per_update_steps = 3
+            else:
+                update_every = 8
+                per_update_steps = 1
+
+            obs = self.env.reset(mode="training")
+            state_vec = encode_obs(obs, self.env).reshape(1, -1)
+
+            done = 0
+            rwd = 0.0
+            t = 0
+            step_since_update = 0
+
+            while not done and t < self.max_timesteps:
+                ar, ac = self.env.agent_loc
+                valid_actions = VALID_ACTS_BY_CELL[ar * 5 + ac]
+                action = agent.select_action(state_vec, valid_actions=valid_actions, training=True)
+
+                reward, next_obs, done = self.env.step(action)
+                next_state_vec = encode_obs(next_obs, self.env).reshape(1, -1)
+                rwd += reward
+
+                # "delivery" spike only: in v0 a delivery gives env.reward/2, BUT can be multiple loads.
+                # Safe detection: reward >= env.reward/2 (pickup is also env.reward/2),
+                # so we use stricter: must be at base & load was >0 pre-drop.
+                # Easiest robust proxy: if reward >= env.reward - small, that's a multi-load delivery.
+                # But in v0 capacity=1 so delivery == reward/2. We'll use a state-based condition:
+                delivered = (self.env.agent_loc == self.env.target_loc) and (reward >= (self.env.reward / 2.0 - 1e-6))
+
+                boost = 1.0
+                if agent.use_spike_boost and delivered and agent.total_env_steps >= agent.spike_boost_warmup_steps:
+                    boost = agent.spike_boost_factor
+
+                agent.memory.add(
+                    state_vec.reshape(-1),
+                    int(action),
+                    float(reward),
+                    next_state_vec.reshape(-1),
+                    float(done),
+                    priority_boost=boost
+                )
+
+                step_since_update += 1
+                if step_since_update % update_every == 0:
+                    agent.update_weights(per_update_steps=per_update_steps)
+
+                state_vec = next_state_vec
+                t += 1
+                agent.total_env_steps += 1
+
+            rew[episode] = rwd
+
+            if (episode + 1) % 25 == 0:
+                start = max(0, episode + 1 - 25)
+                avg25 = float(np.mean(rew[start:episode + 1]))
+                print(f"[TRAIN] Ep {episode + 1}/{no_episodes} Return: {rwd:.1f} | Avg25: {avg25:.1f} | eps={agent.epsilon:.3f}")
+
+            agent.update_epsilon()
+
+            # Top-k checkpointing by quick validation
+            if use_ckpt_topk and ((episode + 1) % ckpt_every == 0):
+                valq = evaluate_average_reward(agent, self.variant, self.env.data_dir,
+                                               episodes=val_quick_episodes, mode="validation")
+                print(f"[CKPT] Ep {episode+1}: val_quick({val_quick_episodes}) = {valq:.2f}")
+                ckpt.maybe_save(agent, episode + 1, valq)
+
+        best_info = None
+        if use_ckpt_topk:
+            best_info = ckpt.select_best_full(
+                agent,
+                eval_full_fn=lambda: evaluate_average_reward(agent, self.variant, self.env.data_dir,
+                                                            episodes=100, mode="validation")
+            )
+            if best_info:
+                print(f"[CKPT] Selected best full-val: {best_info[0]:.2f} from {best_info[1]}")
+
+        final_path = os.path.join(self.save_path, f"final_variant{self.variant}.weights.h5")
+        agent.model.save_weights(final_path, overwrite=True)
+        print(f"[SAVE] Final weights saved: {final_path}")
+
+        return rew, best_info
+
+
+# ============================================================
+# Plot helper
+# ============================================================
+
+def save_training_plot(train_rewards: np.ndarray, avg_val: float, avg_test: float, out_path: str, title: str):
+    plt.figure(figsize=(14, 6))
+    window = 25
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+
+    r = np.array(train_rewards, dtype=np.float32)
+    x = np.arange(1, len(r) + 1)
+    raw_line, = plt.plot(x, r, alpha=0.20, label="Train (raw)")
+
+    if len(r) >= window:
+        mov = np.convolve(r, kernel, mode="valid")
+        xm = np.arange(window, len(r) + 1)
+        plt.plot(xm, mov, label="Train (25-ep avg)", color=raw_line.get_color())
+
+    plt.axhline(y=avg_val, linestyle=":", alpha=0.9, label=f"Val avg ({avg_val:.1f})")
+    plt.axhline(y=avg_test, linestyle="--", alpha=0.9, label=f"Test avg ({avg_test:.1f})")
+    plt.title(title)
+    plt.xlabel("Training episode")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[PLOT] Saved: {out_path}")
+
+
+# ============================================================
+# Main
+# ============================================================
+
+if __name__ == "__main__":
+    VARIANT = 0
+    DATA_DIR = "./data"
+
+    TRAIN_EPISODES = 800
+    VAL_EPISODES = 100
+    TEST_EPISODES = 100
+
+    # Sanity checks
+    check_val_test_overlap(VARIANT, DATA_DIR)
+    verify_eval_unique(VARIANT, DATA_DIR, mode="validation", expected_count=100)
+    verify_eval_unique(VARIANT, DATA_DIR, mode="testing", expected_count=100)
+
+    # Base config (NO Noisy)
+    CONFIG = dict(
+        gamma=0.97,
+        epsilon=1.0,
+        epsilon_min=0.02,
+        epsilon_decay=0.995,
+        batch_size=64,
+        units=256,
+        tau=0.005,
+
+        # PER
+        replay_capacity=50_000,
+        per_alpha=0.6,
+        per_beta0=0.4,
+        per_beta1=1.0,
+        per_eps=1e-6,
+        per_beta_anneal_steps=200_000,
+        learn_start=max(5000, 5 * 64),
+
+        # Spike boost (optional)
+        use_spike_boost=True,            # <--- A/B switch
+        spike_boost_factor=1.5,          # safe
+        spike_boost_warmup_steps=20_000  # safe
+    )
+
+    # Create run folder
+    run_name = "HYBRID_DENSE_DUELING_PHI_PER50K_SPIKEOPT"
+    save_dir = os.path.join(os.getcwd(), run_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Infer state size
+    env_tmp = Environment(VARIANT, DATA_DIR)
+    obs0 = env_tmp.reset("training")
+    state_dim = encode_obs(obs0, env_tmp).shape[0]
+    print(f"[INFO] state_dim={state_dim} (expected 5*5*10=250)")
+
+    # Build agent + trainer
+    agent = DQNAgent(state_dim, ACTIONS, CONFIG)
+    trainer = Trainer(save_path=save_dir, variant=VARIANT, data_dir=DATA_DIR)
+
+    # Train
+    train_rewards, best_info = trainer.train(
+        agent,
+        no_episodes=TRAIN_EPISODES,
+        update_schedule="late_turbo",
+        use_ckpt_topk=True,
+        ckpt_every=50,
+        val_quick_episodes=20,
+        ckpt_topk=5
+    )
+
+    # Final eval (full 100 unique each)
+    avg_val = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=VAL_EPISODES, mode="validation")
+    avg_test = evaluate_average_reward(agent, VARIANT, DATA_DIR, episodes=TEST_EPISODES, mode="testing")
+
+    print("\n===== SUMMARY =====")
+    print(f"{run_name}: VAL={avg_val:.3f} | TEST={avg_test:.3f}")
+    if best_info:
+        print(f"BEST-CKPT: best_full_val={best_info[0]:.3f} path={best_info[1]}")
+
+    # Save plot
+    out_plot = os.path.join(save_dir, f"{run_name}.png")
+    save_training_plot(
+        train_rewards=train_rewards,
+        avg_val=avg_val,
+        avg_test=avg_test,
+        out_path=out_plot,
+        title=f"{run_name}\nDense-Dueling + Φ + PER50k + SpikeBoost(optional)"
+    )
