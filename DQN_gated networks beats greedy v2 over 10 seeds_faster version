@@ -745,9 +745,9 @@ class DQN_Agent:
 
         self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
 
-    # ========================================================
-    # EXPERIMENT 1: ConvLSTM2D planner + TRUE DUELING MAP HEAD
-    # ========================================================
+   
+    # ConvLSTM2D planner + TRUE DUELING MAP HEAD
+   
     def _build_model(self, state_size, action_size, units, old_model_path=""):
         K = int(self.planner_steps)
 
