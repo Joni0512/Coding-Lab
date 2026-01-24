@@ -4,7 +4,7 @@
 # + FIX: Proper PER weights in loss, direct leaf indexing, in-place soft update
 #
 # CHANGE in this version (YOUR REQUEST):
-# 1) Variant-1-aware Φ plane (like your PPO):
+# 1) Variant-1-aware Φ plane:
 #    - if agent_load > 0: strong "go home" bias (towards base)
 #    - else: best-item bias balancing distance vs TTL
 # 2) SPEEDUP: remove model.predict() in step-loop + updates,
