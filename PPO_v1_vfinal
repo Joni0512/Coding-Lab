@@ -1,0 +1,951 @@
+'''
+
+Using env_midterm
+
+Greedy: 384.255
+
+RESULTS
+Seed 10: 389.945 (runtime = 00:31:13)
+Seed 11: 393.840 (runtime = 00:32:34)
+Seed 12: 386.970 (runtime = 00:30:34)
+Seed 13: 390.615 (runtime = 00:31:0)
+Seed 14: 384.890 (runtime = 00:30:32)
+Seed 15: 388.400 (runtime = 00:30:42)
+Seed 16: 385.965 (runtime = 00:30:52)
+Seed 17: (runtime =)
+Seed 18: (runtime =)
+Seed 19: (runtime =)
+
+Option 1 Phi-Plane
+
+'''
+# PPO Variant 1 (capacity=3) — stabilized PPO + capacity-aware shaping features
+# Copy-paste as a single file (expects env_midterm.py providing Environment)
+
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.distributions import Categorical
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+from env_midterm import Environment
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def valid_action_mask(env, n_actions=5):
+    mask = np.zeros(n_actions, dtype=np.bool_)
+    mask[0] = True  # idle always allowed
+
+    r, c = env.agent_loc
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    moves = [
+        (1, -1, 0),  # up
+        (2, 0, 1),   # right
+        (3, 1, 0),   # down
+        (4, 0, -1),  # left
+    ]
+    for act, dr, dc in moves:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < H and 0 <= nc < W and (nr, nc) in env.eligible_cells:
+            mask[act] = True
+
+    return mask
+
+def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
+    """
+    obs_batch: torch tensor [B, obs_dim] with channels-first encoding (C,H,W) flattened.
+    Uses:
+      channel 0: agent position one-hot
+      channel 6: eligible mask
+    Returns: torch.bool tensor [B, n_actions]
+    """
+    device = obs_batch.device
+    B = obs_batch.shape[0]
+
+    grid = obs_batch.view(B, CHANNELS, HEIGHT, WIDTH)
+    agent = grid[:, 0]                 # [B,H,W]
+    eligible = grid[:, 6] > 0.5        # [B,H,W] bool
+
+    mask = torch.zeros((B, n_actions), dtype=torch.bool, device=device)
+    mask[:, 0] = True  # idle always valid
+
+    pos = agent.view(B, -1).argmax(dim=1)
+    ar = (pos // WIDTH).long()
+    ac = (pos % WIDTH).long()
+
+    b_idx = torch.arange(B, device=device)
+
+    # UP (1)
+    ok = (ar > 0)
+    if ok.any():
+        b = b_idx[ok]
+        r = ar[ok] - 1
+        c = ac[ok]
+        ok2 = eligible[b, r, c]
+        mask[b[ok2], 1] = True
+
+    # RIGHT (2)
+    ok = (ac < WIDTH - 1)
+    if ok.any():
+        b = b_idx[ok]
+        r = ar[ok]
+        c = ac[ok] + 1
+        ok2 = eligible[b, r, c]
+        mask[b[ok2], 2] = True
+
+    # DOWN (3)
+    ok = (ar < HEIGHT - 1)
+    if ok.any():
+        b = b_idx[ok]
+        r = ar[ok] + 1
+        c = ac[ok]
+        ok2 = eligible[b, r, c]
+        mask[b[ok2], 3] = True
+
+    # LEFT (4)
+    ok = (ac > 0)
+    if ok.any():
+        b = b_idx[ok]
+        r = ar[ok]
+        c = ac[ok] - 1
+        ok2 = eligible[b, r, c]
+        mask[b[ok2], 4] = True
+
+    return mask
+
+# ============================================================
+# CNN SHAPE
+# ============================================================
+
+CHANNELS = 10
+HEIGHT = 5
+WIDTH = 5
+
+# ============================================================
+# Distance structures
+# ============================================================
+
+def _build_distance_structs(env):
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+
+    variant = env.variant
+    H, W = 5, 5
+
+    if variant in (0, 1):
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_r, i_c = i // 5, i % 5
+                j_r, j_c = j // 5, j % 5
+                if (j_r - i_r == 0 and j_c - i_c == 1) or (j_r - i_r == 1 and j_c - i_c == 0):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 0.0
+
+    else:
+        # variant 2 mapping (not used for v1, but keep for completeness)
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3),
+            (0, 4), (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1); link(1, 2); link(2, 3); link(3, 4)
+        link(3, 5); link(4, 6); link(5, 6)
+        link(5, 10); link(6, 11)
+        link(7, 8); link(7, 12); link(8, 9); link(9, 10); link(10, 11)
+        link(12, 13); link(13, 14); link(14, 15); link(15, 16); link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+        env._dist_from_idx_grids = dist_grids
+
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 0.0
+
+    env._dist_ready = True
+
+def _coord_to_idx(env, coord):
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    return env._coord_to_idx[coord]
+
+# ============================================================
+# PPO observation encoding (CHW flatten) — capacity-aware Φ
+# ============================================================
+
+def encode_obs(obs, env, feature_mode="full"):
+    step, agent_loc, agent_load, item_locs, item_times = obs
+
+    _build_distance_structs(env)
+
+    H, W, C = HEIGHT, WIDTH, CHANNELS
+    state = np.zeros((C, H, W), dtype=np.float32)
+
+    # 6: eligible mask
+    if env.variant in (0, 1):
+        state[6, :, :] = 1.0
+    else:
+        eligible_set = set(env.eligible_cells)
+        for r in range(H):
+            for c in range(W):
+                state[6, r, c] = 1.0 if (r, c) in eligible_set else 0.0
+
+    # 0: agent position
+    ar, ac = agent_loc
+    state[0, ar, ac] = 1.0
+
+    # 1,2,5: items (presence, age norm, TTL norm)
+    for (loc, age) in zip(item_locs, item_times):
+        r, c = loc
+        state[1, r, c] = 1.0
+        state[2, r, c] = age / env.max_response_time
+        state[5, r, c] = (env.max_response_time - age) / env.max_response_time
+
+    # 3/4: distances normalized
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+
+    max_dist = getattr(env, "_max_dist", 0.0)
+    if max_dist and max_dist > 0:
+        state[3, :, :] = dist_agent_grid / max_dist
+        state[4, :, :] = env._dist_base_grid / max_dist
+    else:
+        state[3, :, :] = 0.0
+        state[4, :, :] = 0.0
+
+    # 7: step norm
+    state[7, :, :] = step / float(env.episode_steps)
+
+    # 8: load norm (important in variant 1)
+    state[8, :, :] = agent_load / float(env.agent_capacity)
+
+    # 9: Φ plane (variant-1 load-bucket regimes)
+    phi_plane = np.zeros((H, W), dtype=np.float32)
+    if max_dist <= 0:
+        max_dist = 1.0
+
+    # normalized distance grids
+    d_agent = dist_agent_grid / max_dist
+    d_base = env._dist_base_grid / max_dist
+
+    # compute "best item urgency" scalar (0..1), higher = more urgent/valuable
+    best_ttl = 0.0
+    if len(item_locs) > 0:
+        best_phi = -np.inf
+        for (loc, age) in zip(item_locs, item_times):
+            r, c = loc
+            d = d_agent[r, c]
+            ttl = (env.max_response_time - age) / env.max_response_time  # 0..1, higher = more time left
+            # prefer close and urgent-ish: treat urgency as (1-ttl)
+            score = -1.0 * d + 1.3 * (1.0 - ttl)
+            if score > best_phi:
+                best_phi = score
+                best_ttl = ttl
+
+    # base and item terms (same structure across regimes)
+    base_term = -1.2 * d_base
+
+    # item_term uses full plane distance-to-agent plus a scalar urgency component
+    # (scalar broadcasts across grid)
+    item_term = -1.0 * d_agent + 1.3 * (1.0 - best_ttl)
+
+    # load buckets for capacity=3 (works for other caps too)
+    cap = float(env.agent_capacity)
+    load = float(agent_load)
+
+    # regime weights (alpha = weight on going home)
+    # tuned for v1 batching: load=1 still mostly collect, load=2 mostly deposit, full = deposit hard
+    if load <= 0:
+        alpha = 0.00
+        detour_penalty = 1.0
+    elif load < cap:
+        frac = load / cap  # 1/3 or 2/3
+        if frac <= 0.34:
+            alpha = 0.25
+            detour_penalty = 1.2
+        else:
+            alpha = 0.70
+            detour_penalty = 1.5
+    else:
+        alpha = 1.00
+        detour_penalty = 1.8
+
+    # strengthen "don't wander" as load increases by increasing distance penalty in item term
+    item_term = -detour_penalty * d_agent + 1.3 * (1.0 - best_ttl)
+
+    # mix
+    phi_plane = (1.0 - alpha) * item_term + alpha * base_term
+
+    phi_plane = np.clip(phi_plane, -1.0, 1.0)
+    state[9, :, :] = phi_plane
+
+    # feature_mode toggles (keep yours)
+    fm = feature_mode
+    if fm == "full":
+        pass
+    elif fm == "reduced_full":
+        state[2, :, :] = 0.0
+        state[7, :, :] = 0.0
+    elif fm == "no_distance":
+        state[3, :, :] = 0.0
+        state[4, :, :] = 0.0
+    elif fm == "expiry_focused":
+        state[2, :, :] = 0.0
+        threshold = 3
+        for (loc, age) in zip(item_locs, item_times):
+            r, c = loc
+            if env.max_response_time - age <= threshold:
+                state[2, r, c] = 1.0
+    elif fm == "minimal":
+        keep = {0, 1, 5, 8}
+        for ch in range(C):
+            if ch not in keep:
+                state[ch, :, :] = 0.0
+    else:
+        raise ValueError(f"Invalid feature_mode: {fm}")
+
+    return state.reshape(-1)
+
+# ============================================================
+# CNN Policy & Value (NO NoisyLinear in actor)
+# ============================================================
+
+class PolicyNet(nn.Module):
+    def __init__(self, obs_dim, n_actions, hidden_dim=256):
+        super().__init__()
+        self.channels = CHANNELS
+        self.height = HEIGHT
+        self.width = WIDTH
+        assert obs_dim == self.channels * self.height * self.width
+
+        self.conv1 = nn.Conv2d(self.channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        conv_out_dim = 64 * self.height * self.width
+
+        self.fc1 = nn.Linear(conv_out_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.logits = nn.Linear(hidden_dim, n_actions)
+
+    def forward(self, x):
+        x = x.view(-1, self.channels, self.height, self.width)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = F.relu(self.ln2(self.fc2(x)))
+        return self.logits(x)
+
+class ValueNet(nn.Module):
+    def __init__(self, obs_dim, hidden_dim=256):
+        super().__init__()
+        self.channels = CHANNELS
+        self.height = HEIGHT
+        self.width = WIDTH
+        assert obs_dim == self.channels * self.height * self.width
+
+        self.conv1 = nn.Conv2d(self.channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        conv_out_dim = 64 * self.height * self.width
+
+        self.fc1 = nn.Linear(conv_out_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = x.view(-1, self.channels, self.height, self.width)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = F.relu(self.ln2(self.fc2(x)))
+        return self.v(x).squeeze(-1)
+
+# ============================================================
+# PPO Buffer (reward norm + correct GAE + episode reset)
+# ============================================================
+
+class PPOBuffer:
+    def __init__(self, obs_dim, device):
+        self.obs_dim = obs_dim
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.obs = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.last_values = []  # V(s_{t+1}) for each step
+
+    def store(self, obs, action, reward, done, log_prob, value, next_value):
+        self.obs.append(np.array(obs, dtype=np.float32))
+        self.actions.append(int(action))
+        self.rewards.append(float(reward))
+        self.dones.append(float(done))
+        self.log_probs.append(float(log_prob))
+        self.values.append(float(value))
+        self.last_values.append(float(next_value))
+
+    def compute_advantages(self, gamma, lam, reward_norm=True):
+        rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
+        values = torch.tensor(self.values, dtype=torch.float32, device=self.device)
+        next_values = torch.tensor(self.last_values, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(self.dones, dtype=torch.float32, device=self.device)
+
+        # per-rollout reward normalization (stabilizes)
+        if reward_norm:
+            r_mean = rewards.mean()
+            r_std = rewards.std(unbiased=False) + 1e-8
+            rewards = (rewards - r_mean) / r_std
+
+        T = len(rewards)
+        advantages = torch.zeros(T, dtype=torch.float32, device=self.device)
+
+        gae = 0.0
+        for t in reversed(range(T)):
+            # reset at episode boundary (important because buffer spans multiple episodes)
+            if dones[t] > 0.5:
+                gae = 0.0
+
+            delta = rewards[t] + gamma * next_values[t] - values[t]
+            gae = delta + gamma * lam * gae
+            advantages[t] = gae
+
+        self.advantages = advantages
+        self.returns = advantages + values
+
+    def get(self):
+        obs_np = np.asarray(self.obs, dtype=np.float32)
+        actions_np = np.asarray(self.actions, dtype=np.int64)
+        logp_np = np.asarray(self.log_probs, dtype=np.float32)
+        values_np = np.asarray(self.values, dtype=np.float32)
+
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(actions_np, dtype=torch.long, device=self.device)
+        old_log_probs = torch.as_tensor(logp_np, dtype=torch.float32, device=self.device)
+        old_values = torch.as_tensor(values_np, dtype=torch.float32, device=self.device)
+
+        return obs, actions, old_log_probs, old_values, self.advantages, self.returns
+
+# ============================================================
+# PPO Agent (LR anneal + entropy decay)
+# ============================================================
+
+class PPOAgent:
+    def __init__(
+        self,
+        obs_dim,
+        n_actions,
+        gamma=0.99,
+        lam=0.90,
+        clip_ratio=0.08,
+        pi_lr=3e-4,
+        vf_lr=2e-4,
+        train_epochs=10,
+        minibatch_size=64,
+        entropy_start=0.015,
+        entropy_end=0.003,
+        device="cpu",
+        target_kl=0.015,
+        max_grad_norm=0.5,
+        vf_clip_ratio=0.2,
+        total_updates=1,
+    ):
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.gamma = float(gamma)
+        self.lam = float(lam)
+        self.clip_ratio = float(clip_ratio)
+        self.train_epochs = int(train_epochs)
+        self.minibatch_size = int(minibatch_size)
+        self.device = torch.device(device)
+
+        self.target_kl = float(target_kl)
+        self.max_grad_norm = float(max_grad_norm)
+        self.vf_clip_ratio = float(vf_clip_ratio)
+
+        self.entropy_start = float(entropy_start)
+        self.entropy_end = float(entropy_end)
+
+        self.policy = PolicyNet(obs_dim, n_actions).to(self.device)
+        self.value_fn = ValueNet(obs_dim).to(self.device)
+
+        self.pi_optimizer = Adam(self.policy.parameters(), lr=float(pi_lr))
+        self.vf_optimizer = Adam(self.value_fn.parameters(), lr=float(vf_lr))
+
+        self.pi_lr_init = float(pi_lr)
+        self.vf_lr_init = float(vf_lr)
+
+        self.total_updates = max(1, int(total_updates))
+        self.update_count = 0
+
+    def _anneal(self):
+        # linear annealing from 1.0 -> 0.3
+        frac = min(1.0, self.update_count / float(self.total_updates))
+        lr_mult = 1.0 - 0.7 * frac
+        for pg in self.pi_optimizer.param_groups:
+            pg["lr"] = self.pi_lr_init * lr_mult
+        for pg in self.vf_optimizer.param_groups:
+            pg["lr"] = self.vf_lr_init * lr_mult
+
+        # entropy decay
+        entropy_coef = self.entropy_start + frac * (self.entropy_end - self.entropy_start)
+        return float(entropy_coef)
+
+    @torch.no_grad()
+    def select_action(self, obs_vec, env=None, eval_mode=False):
+        if eval_mode:
+            self.policy.eval()
+            self.value_fn.eval()
+        else:
+            self.policy.train()
+            self.value_fn.train()
+
+        obs_t = torch.as_tensor(obs_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        logits = self.policy(obs_t)
+
+        if env is not None:
+            mask_np = valid_action_mask(env, self.n_actions)
+            mask_t = torch.as_tensor(mask_np, device=self.device).unsqueeze(0)
+            logits = logits.masked_fill(~mask_t, -1e9)
+
+        dist = Categorical(logits=logits)
+
+        if eval_mode:
+            action = torch.argmax(dist.probs, dim=-1)
+        else:
+            action = dist.sample()
+
+        log_prob = dist.log_prob(action)
+        value = self.value_fn(obs_t)
+
+        return int(action.item()), float(log_prob.item()), float(value.item())
+
+    def update(self, buffer: PPOBuffer):
+        self.policy.train()
+        self.value_fn.train()
+
+        # update count -> anneal schedules
+        entropy_coef = self._anneal()
+
+        obs, actions, old_log_probs, old_values, advantages, returns = buffer.get()
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+        N = obs.size(0)
+        idxs = np.arange(N)
+
+        for _ in range(self.train_epochs):
+            np.random.shuffle(idxs)
+            approx_kls = []
+
+            for start in range(0, N, self.minibatch_size):
+                mb_idx = idxs[start:start + self.minibatch_size]
+                mb_idx_t = torch.as_tensor(mb_idx, dtype=torch.long, device=self.device)
+
+                mb_obs = obs[mb_idx_t]
+                mb_actions = actions[mb_idx_t]
+                mb_old_logp = old_log_probs[mb_idx_t]
+                mb_old_v = old_values[mb_idx_t]
+                mb_adv = advantages[mb_idx_t]
+                mb_returns = returns[mb_idx_t]
+
+                logits = self.policy(mb_obs)
+                mask = valid_action_mask_from_obs_batch(mb_obs, self.n_actions)
+                logits = logits.masked_fill(~mask, -1e9)
+
+                dist = Categorical(logits=logits)
+                new_logp = dist.log_prob(mb_actions)
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(new_logp - mb_old_logp)
+                unclipped = ratio * mb_adv
+                clipped = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * mb_adv
+                policy_loss = -torch.min(unclipped, clipped).mean()
+
+                # value loss: HUBER + value clipping
+                v_pred = self.value_fn(mb_obs)
+                v_pred_clipped = mb_old_v + torch.clamp(
+                    v_pred - mb_old_v, -self.vf_clip_ratio, self.vf_clip_ratio
+                )
+                v_loss_unclipped = F.smooth_l1_loss(v_pred, mb_returns)
+                v_loss_clipped = F.smooth_l1_loss(v_pred_clipped, mb_returns)
+                value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+
+                # actor
+                self.pi_optimizer.zero_grad(set_to_none=True)
+                (policy_loss - entropy_coef * entropy).backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.pi_optimizer.step()
+
+                # critic
+                self.vf_optimizer.zero_grad(set_to_none=True)
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value_fn.parameters(), self.max_grad_norm)
+                self.vf_optimizer.step()
+
+                approx_kl = (mb_old_logp - new_logp).mean().item()
+                approx_kls.append(approx_kl)
+
+            if len(approx_kls) > 0 and np.mean(approx_kls) > 1.5 * self.target_kl:
+                break
+
+        self.update_count += 1
+
+# ============================================================
+# Train + Val + Test
+# ============================================================
+
+def run_eval_silent(env, agent, feature_mode, mode, episodes):
+    returns = []
+    max_eps = min(episodes, len(env.validation_episodes) if mode == "validation" else len(env.test_episodes))
+
+    with torch.inference_mode():
+        for _ in range(max_eps):
+            raw = env.reset(mode=mode)
+            obs_vec = encode_obs(raw, env, feature_mode=feature_mode)
+
+            done = False
+            ep_ret = 0.0
+            while not done:
+                action, _, _ = agent.select_action(obs_vec, env=env, eval_mode=True)
+                rew, raw_next, done_flag = env.step(action)
+                obs_vec = encode_obs(raw_next, env, feature_mode=feature_mode)
+                ep_ret += rew
+                done = bool(done_flag)
+
+            returns.append(ep_ret)
+
+    return returns
+
+def summarize_returns(name, returns):
+    arr = np.asarray(returns, dtype=np.float32)
+    n = len(arr)
+    print(f"\n=== {name} statistics ===")
+    if n == 0:
+        print("No episodes recorded.")
+        print("================================\n")
+        return
+    best_ret = float(arr.max())
+    best_ep = int(arr.argmax()) + 1
+    mean_all = float(arr.mean())
+    std_all = float(arr.std())
+    window = min(100, n)
+    mean_last = float(arr[-window:].mean())
+    print(f"Episodes total:              {n}")
+    print(f"Best episode:                {best_ep}  (return = {best_ret:.2f})")
+    print(f"Mean return (all):           {mean_all:.2f} ± {std_all:.2f}")
+    print(f"Mean return (last {window}): {mean_last:.2f}")
+    print("================================\n")
+
+def train_and_test_ppo(
+    data_dir,
+    variant=1,
+    feature_mode="full",
+    train_episodes=6000,
+    validation_episodes=100,
+    test_episodes=100,
+    gamma=0.99,
+    lam=0.90,
+    clip_ratio=0.08,
+    pi_lr=3e-4,
+    vf_lr=2e-4,
+    train_epochs=10,
+    minibatch_size=64,
+    entropy_start=0.015,
+    entropy_end=0.003,
+    device="cpu",
+    print_interval=250,
+    seed=17,
+    show_plot=False,
+    # checkpoint params
+    save_every=50,
+    ckpt_dir="./checkpoints_v1",
+    # rollout param
+    rollout_episodes_per_update=16,
+):
+    set_global_seed(seed)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    env = Environment(variant=variant, data_dir=data_dir)
+    n_actions = 5
+
+    raw0 = env.reset(mode="training")
+    obs_vec0 = encode_obs(raw0, env, feature_mode=feature_mode)
+    obs_dim = obs_vec0.shape[0]
+    print(f"Obs_dim={obs_dim}, n_actions={n_actions}, feature_mode='{feature_mode}', variant={variant}")
+
+    # number of PPO updates for annealing schedules
+    total_updates = max(1, int(np.ceil(train_episodes / float(rollout_episodes_per_update))))
+
+    agent = PPOAgent(
+        obs_dim=obs_dim,
+        n_actions=n_actions,
+        gamma=gamma,
+        lam=lam,
+        clip_ratio=clip_ratio,
+        pi_lr=pi_lr,
+        vf_lr=vf_lr,
+        train_epochs=train_epochs,
+        minibatch_size=minibatch_size,
+        entropy_start=entropy_start,
+        entropy_end=entropy_end,
+        device=device,
+        target_kl=0.015,
+        max_grad_norm=0.5,
+        vf_clip_ratio=0.2,
+        total_updates=total_updates,
+    )
+
+    buffer = PPOBuffer(obs_dim=obs_dim, device=agent.device)
+    train_returns = []
+
+    best_val_mean = -np.inf
+    best_ckpt_path = os.path.join(ckpt_dir, f"ppo_bestVAL_variant{variant}_seed{seed}.pt")
+
+    buffer.reset()
+    episodes_in_rollout = 0
+    update_idx = 0
+
+    for ep in range(train_episodes):
+        raw = env.reset(mode="training")
+        obs_vec = encode_obs(raw, env, feature_mode=feature_mode)
+
+        done = False
+        ep_ret = 0.0
+
+        while not done:
+            action, logp, value = agent.select_action(obs_vec, env=env, eval_mode=False)
+            rew, raw_next, done_flag = env.step(action)
+            obs_next_vec = encode_obs(raw_next, env, feature_mode=feature_mode)
+
+            done_bool = bool(done_flag)
+
+            # next_value = V(s_{t+1})
+            with torch.no_grad():
+                obs_next_t = torch.as_tensor(obs_next_vec, dtype=torch.float32, device=agent.device).unsqueeze(0)
+                next_value = float(agent.value_fn(obs_next_t).item())
+
+            buffer.store(obs_vec, action, rew, done_bool, logp, value, next_value)
+
+            obs_vec = obs_next_vec
+            ep_ret += rew
+            done = done_bool
+
+        train_returns.append(ep_ret)
+        episodes_in_rollout += 1
+
+        if (episodes_in_rollout >= rollout_episodes_per_update) or (ep == train_episodes - 1):
+            buffer.compute_advantages(gamma=gamma, lam=lam, reward_norm=True)
+            agent.update(buffer)
+            buffer.reset()
+            episodes_in_rollout = 0
+            update_idx += 1
+
+            # Validation checkpointing in time intervals (like your v0 script)
+            if (update_idx) % int(save_every) == 0 or (ep == train_episodes - 1):
+                val_env = Environment(variant=variant, data_dir=data_dir)
+                val_returns = run_eval_silent(val_env, agent, feature_mode, mode="validation", episodes=validation_episodes)
+                val_mean = float(np.mean(val_returns)) if len(val_returns) else -np.inf
+                print(f"[CKPT] update {update_idx}/{total_updates}  val_mean={val_mean:.3f}  best_val={best_val_mean:.3f}")
+
+                if val_mean > best_val_mean:
+                    best_val_mean = val_mean
+                    torch.save(
+                        {
+                            "policy_state_dict": agent.policy.state_dict(),
+                            "value_state_dict": agent.value_fn.state_dict(),
+                            "best_val_mean": best_val_mean,
+                            "update": update_idx,
+                            "episode": ep + 1,
+                            "variant": variant,
+                            "seed": seed,
+                            "feature_mode": feature_mode,
+                            "obs_dim": obs_dim,
+                            "n_actions": n_actions,
+                            "gamma": gamma,
+                            "lam": lam,
+                            "clip_ratio": clip_ratio,
+                            "pi_lr": pi_lr,
+                            "vf_lr": vf_lr,
+                            "entropy_start": entropy_start,
+                            "entropy_end": entropy_end,
+                            "rollout_episodes_per_update": rollout_episodes_per_update,
+                        },
+                        best_ckpt_path,
+                    )
+                    print(f"[CKPT] saved new best-val checkpoint -> {best_ckpt_path}")
+
+        if (ep + 1) % print_interval == 0:
+            avgN = float(np.mean(train_returns[-print_interval:]))
+            print(f"[TRAIN] Ep {ep+1}/{train_episodes}  Return: {ep_ret:.1f}  Avg(last {print_interval}): {avgN:.1f}")
+
+    if os.path.exists(best_ckpt_path):
+        ckpt = torch.load(best_ckpt_path, map_location=device)
+        agent.policy.load_state_dict(ckpt["policy_state_dict"])
+        agent.value_fn.load_state_dict(ckpt["value_state_dict"])
+        print(f"\nLoaded BEST-VAL checkpoint from update {ckpt['update']} with best_val_mean={ckpt['best_val_mean']:.2f}\n")
+    else:
+        print("\nNo BEST checkpoint found; using final training weights.\n")
+
+    # Final evaluation (silent, like v0 style)
+    val_env = Environment(variant=variant, data_dir=data_dir)
+    test_env = Environment(variant=variant, data_dir=data_dir)
+
+    val_returns = run_eval_silent(val_env, agent, feature_mode, mode="validation", episodes=validation_episodes)
+    test_returns = run_eval_silent(test_env, agent, feature_mode, mode="testing", episodes=test_episodes)
+
+    if show_plot:
+        episodes_train = np.arange(1, train_episodes + 1)
+        plt.figure()
+        plt.plot(episodes_train, train_returns, label="Train return")
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("PPO – Training Returns (Variant 1)")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    summarize_returns("Training", train_returns)
+    summarize_returns("Validation", val_returns)
+    summarize_returns("Testing", test_returns)
+
+    return agent, train_returns, val_returns, test_returns, best_ckpt_path
+
+if __name__ == "__main__":
+    DATA_DIR = "./data"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    VARIANT = 1
+    TRAIN_EPISODES = 6000
+    VAL_EPISODES = 100
+    TEST_EPISODES = 100
+    SEED= 17
+
+    print("\n" + "#" * 70)
+    print(f"### Starting PPO run for seed = {SEED} (VARIANT={VARIANT})")
+    print("#" * 70 + "\n")
+
+    t0 = time.time()
+
+    agent, train_returns, val_returns, test_returns, best_ckpt_path = train_and_test_ppo(
+        data_dir=DATA_DIR,
+        variant=VARIANT,
+        feature_mode="full",
+        train_episodes=TRAIN_EPISODES,
+        validation_episodes=VAL_EPISODES,
+        test_episodes=TEST_EPISODES,
+        gamma=0.99,
+        lam=0.90,
+        clip_ratio=0.08,
+        pi_lr=3e-4,
+        vf_lr=2e-4,
+        train_epochs=10,
+        minibatch_size=64,
+        entropy_start=0.015,
+        entropy_end=0.003,
+        device=device,
+        seed=SEED,
+        show_plot=False,
+        print_interval=250,
+        save_every=50,
+        ckpt_dir="./checkpoints_v1",
+        rollout_episodes_per_update=16,
+    )
+
+    val_mean = float(np.mean(val_returns)) if len(val_returns) > 0 else float("nan")
+    test_mean = float(np.mean(test_returns)) if len(test_returns) > 0 else float("nan")
+
+    print(f"\nBEST checkpoint path: {best_ckpt_path}")
+    print(f"[Seed {SEED}] Validation mean over {len(val_returns)} eps: {val_mean:.3f}")
+    print(f"[Seed {SEED}] Testing   mean over {len(test_returns)} eps: {test_mean:.3f}")
+
+    dt = time.time() - t0
+    h = int(dt // 3600)
+    m = int((dt % 3600) // 60)
+    s = dt % 60
+    print(f"[Seed {SEED}] Wall time: {h:02d}:{m:02d}:{s:06.3f}  (hh:mm:ss.sss)")
+
+    benchmark = 385.425
+    if test_mean > benchmark:
+        print("YAY YOU BEAT THE BENCHMARK")
+    else:
+        print("Not yet above benchmark.")
