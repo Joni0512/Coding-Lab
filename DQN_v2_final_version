@@ -1,26 +1,8 @@
-#!/usr/bin/env python3
-# ============================================================
+
 # Noisy Dueling Double-DQN with CNN (VARIANT 2)
-# + EXPERIMENT 1: Masked ConvLSTM2D Planner
-# + FIX: Proper PER weights in loss, direct leaf indexing, in-place soft update
-#
-# CHANGE REQUEST (IMPLEMENTED):
-# - Train in CHUNKS of 50 episodes
-# - After EACH 50 train episodes:
-#     * save weights checkpoint
-#     * run 50 validation episodes (ALWAYS the same 50: reset validation counter)
-#     * compute mean validation score
-#     * keep BEST checkpoint by this mean
-# - At the END:
-#     * load BEST checkpoint
-#     * run FINAL validation (100 episodes) + FINAL testing (100 episodes)
-#     * report results
-#
-# NOTE: Your pasted encode_obs() had two bugs:
-#   1) used "rr" without defining it
-#   2) missing return
-# Both are fixed below.
-# ============================================================
+# +  Masked ConvLSTM2D Planner
+# + Proper PER weights in loss, direct leaf indexing, in-place soft update
+
 from datetime import datetime
 import time
 
@@ -60,10 +42,7 @@ try:
 except ImportError:
     HAVE_SKOPT = False
 
-
-# ============================================================
 # Defaults
-# ============================================================
 
 DATA_DIR = "./data"
 DATA_DIR_DEFAULT = DATA_DIR
@@ -76,13 +55,10 @@ CHANNELS = 10  # 0..8 + 9=Phi
 NO_OF_ACTIONS = 5
 
 
-# ============================================================
-# Reproducibility
-# ============================================================
 
-# ============================================================
 # Reproducibility
-# ============================================================
+
+
 
 def set_global_seed(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -111,11 +87,7 @@ def format_seconds(sec: float) -> str:
         return f"{m}m {s:05.2f}s"
     return f"{s:.2f}s"
 
-
-# ============================================================
 # 1. Distance structures
-# ============================================================
-
 def _build_distance_structs(env):
     if hasattr(env, "_dist_ready") and env._dist_ready:
         return
@@ -229,9 +201,8 @@ def _coord_to_idx(env, coord):
     return env._coord_to_idx[coord]
 
 
-# ============================================================
 # 2. CNN observation encoding (+ Φ)  [SPEEDUP: cached eligible mask grid]
-# ============================================================
+
 
 def _ensure_eligible_cache(env):
     # Cache eligible set + grid mask for fast encoding
@@ -327,9 +298,7 @@ def encode_obs(obs, env):
     return state.reshape(-1).copy()
 
 
-# ============================================================
 # 3. Renderer (optional)
-# ============================================================
 
 class PrettyRenderer:
     def __init__(self, env, fps=8, render_every=2):
@@ -403,10 +372,7 @@ class PrettyRenderer:
         if self.fig is not None:
             plt.show()
 
-
-# ============================================================
 # 4. Action masking helper  [SPEEDUP: cached eligible set]
-# ============================================================
 
 def compute_valid_actions(env):
     _ensure_eligible_cache(env)
@@ -427,9 +393,8 @@ def compute_valid_actions(env):
     return np.array(valid, dtype=np.int32)
 
 
-# ============================================================
 # 5. GymEnvironment wrapper
-# ============================================================
+
 
 class GymEnvironment:
     def __init__(self, env_id, save_path, render=False, variant=2, data_dir="./data",
@@ -590,9 +555,7 @@ class GymEnvironment:
         return all_train_rewards, best_val, best_path, best_at_ep
 
 
-# ============================================================
 # 6. Replay buffers
-# ============================================================
 
 class UniformReplayBuffer:
     def __init__(self, state_dim, capacity=50_000):
@@ -748,9 +711,7 @@ class PrioritizedReplayBuffer:
             self.sumtree.add(float(p), int(i))
 
 
-# ============================================================
 # 7. Noisy layer
-# ============================================================
 
 class NoisyDense(tf.keras.layers.Layer):
     def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
@@ -808,9 +769,7 @@ class NoisyDense(tf.keras.layers.Layer):
         return out
 
 
-# ============================================================
 # 8. DQN Agent (Double DQN + PER fix)
-# ============================================================
 
 class DQN_Agent:
     def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
@@ -1120,9 +1079,8 @@ class DQN_Agent:
 
         self._soft_update_target()
         self.total_updates += 1
-# ============================================================
+
 # 9) Evaluation helper
-# ============================================================
 
 def evaluate_on_env(agent, env, episodes=100, mode="testing", return_all=False):
     max_steps = min(getattr(env, "episode_steps", 200), 200)
@@ -1157,10 +1115,7 @@ def evaluate_on_env(agent, env, episodes=100, mode="testing", return_all=False):
         return rets
     return float(np.mean(rets))
 
-
-# ============================================================
 # 10) Normal entrypoint: chunk train + best checkpoint selection
-# ============================================================
 
 def run_one(seed: int,
             train_episodes=800,
@@ -1178,7 +1133,7 @@ def run_one(seed: int,
     VARIANT = 2
 
     BASE_CONFIG = dict(
-        gamma=0.96, #0.9389065584049
+        gamma=0.96,
         epsilon=1.0,
         batch_size=32,
         epsilon_min=0.079088807071618797,
@@ -1270,9 +1225,8 @@ def run_one(seed: int,
     return train_rewards, val_returns, test_returns
 
 
-# ============================================================
 # 11) Standalone run
-# ============================================================
+
 
 if __name__ == "__main__":
     import argparse
