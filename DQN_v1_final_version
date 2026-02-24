@@ -1,17 +1,15 @@
-#!/usr/bin/env python3
-# ============================================================
+
 # Noisy Dueling Double-DQN with CNN (ENV VARIANT 1)
-# + EXPERIMENT 1: Masked ConvLSTM2D Planner
+# + Masked ConvLSTM2D Planner
 # + PER (fixed): proper IS weights in loss + direct leaf indexing
 # + Soft target update: in-place assign
 # + SPEEDUP: no model.predict() in loop (direct forward pass)
-#
-# SPEED PATCH (requested):
+# SPEED PATCH 
 # 1) encode_obs(): precompute + vectorize (Phi plane kept identical)
 # 2) Training: remove .numpy() from update_weights() hot path (tensor-only math)
 # 3) compute_valid_actions(): O(1) eligible checks via precomputed grid
 # 4) Debug-numerics only when needed (DEBUG_NUMERICS flag)
-# ============================================================
+
 
 import os
 import random
@@ -26,7 +24,6 @@ import faulthandler; faulthandler.enable()
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-# IMPORTANT: adjust this import to your project
 from Environment import Environment
 
 from tensorflow.keras import Model, Input
@@ -42,9 +39,9 @@ matplotlib.rcParams["font.family"] = "DejaVu Sans"
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 
-# ============================================================
+
 # Defaults
-# ============================================================
+
 
 DATA_DIR_DEFAULT = "./data"
 DEFAULT_SEED = 13
@@ -217,8 +214,7 @@ def _ensure_fast_grids(env):
 
 
 
-# 2) CNN observation encoding (Phi plane kept IDENTICAL)
-
+# 2) CNN observation encoding 
 
 def encode_obs(obs, env):
     step, agent_loc, agent_load, item_locs, item_times = obs
@@ -264,9 +260,7 @@ def encode_obs(obs, env):
     # 8: load norm
     state[:, :, 8] = agent_load / float(env.agent_capacity)
 
-    # 9: Phi plane (KEEP IDENTICAL LOGIC)
-
-    # NOTE: identical math to your original, just fewer Python loops.
+    # 9: Phi plane 
     d_agent = dist_agent_grid / max_dist
     d_base = env._dist_base_grid / max_dist
 
@@ -314,9 +308,7 @@ def encode_obs(obs, env):
     return state.reshape(-1)
 
 
-# ============================================================
-# 3) Action masking helper (O(1) eligible checks)
-# ============================================================
+# 3) Action masking helper
 
 def compute_valid_actions(env):
     _ensure_fast_grids(env)
@@ -340,9 +332,7 @@ def compute_valid_actions(env):
     return np.asarray(valid, dtype=np.int32)
 
 
-# ============================================================
 # 4) Replay buffers (PER)
-# ============================================================
 
 class UniformReplayBuffer:
     def __init__(self, state_dim, capacity=50_000):
@@ -498,9 +488,9 @@ class PrioritizedReplayBuffer:
             self.sumtree.add(float(p), int(i))
 
 
-# ============================================================
+
 # 5) Noisy layer
-# ============================================================
+
 
 class NoisyDense(tf.keras.layers.Layer):
     def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
@@ -557,9 +547,7 @@ class NoisyDense(tf.keras.layers.Layer):
         return out
 
 
-# ============================================================
-# 6) DQN Agent (Masked ConvLSTM planner head)
-# ============================================================
+# 6) DQN Agent with Masked ConvLSTM planner hea
 
 class DQN_Agent:
     def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
@@ -741,7 +729,6 @@ class DQN_Agent:
             model.load_weights(old_model_path)
         return model
 
-    # (unchanged) still uses .numpy() for action selection; not in requested patch list
     def select_action(self, state, valid_actions=None, training=True):
         if valid_actions is None:
             valid_actions = np.arange(self.action_size, dtype=np.int32)
@@ -876,9 +863,8 @@ class DQN_Agent:
         self.total_updates += 1
 
 
-# ============================================================
 # 7) GymEnvironment wrapper (training loop + checkpoint cycles)
-# ============================================================
+
 
 class GymEnvironment:
     def __init__(self, env_id=None, save_path="./save", render=False, variant=1, data_dir="./data"):
@@ -962,7 +948,7 @@ class GymEnvironment:
     ):
         os.makedirs(self.save_path, exist_ok=True)
 
-        # --- FIXED validation env (immer gleiche val_episodes Episoden) ---
+        # FIXED validation env (always same validation episodes)
         env_val_fixed = Environment(self.variant, data_dir)
         env_val_fixed.validation_episodes = env_val_fixed.validation_episodes[:val_episodes]
 
@@ -992,7 +978,7 @@ class GymEnvironment:
             ckpt_path = os.path.join(self.save_path, ckpt_name)
             agent.model.save_weights(ckpt_path, overwrite=True)
 
-            # eval on fixed validation (gleiche Reihenfolge)
+            # eval on fixed validation 
             env_val_fixed.validation_episode_counter = 0
             avg_val = evaluate_on_env(agent, env_val_fixed, episodes=val_episodes, mode="validation")
 
@@ -1010,9 +996,8 @@ class GymEnvironment:
         return all_train_rewards, best_val, best_path, best_at_ep
 
 
-# ============================================================
+
 # 8) Evaluation helpers
-# ============================================================
 
 def evaluate_on_env(agent, env, episodes=100, mode="validation"):
     max_steps = min(getattr(env, "episode_steps", 200), 200)
@@ -1082,9 +1067,8 @@ def evaluate_on_env_returns(agent, env, episodes=100, mode="validation"):
     return returns
 
 
-# ============================================================
-# 9) MAIN (Gamma fix 0.929, Seed Sweep)
-# ============================================================
+# 9) MAIN
+
 
 if __name__ == "__main__":
     import json
@@ -1116,7 +1100,7 @@ if __name__ == "__main__":
         per_beta1=1.0,
         per_eps=1e-6,
         per_beta_anneal_steps=200_000,
-        replay_capacity=20_000,
+        replay_capacity=50_000,
         learn_start=5000,
         use_noisy=True,
         noisy_sigma0=0.12546649741233012,
@@ -1154,7 +1138,7 @@ if __name__ == "__main__":
 
         t0 = time.time()
 
-        # ---- 50 train → 50 fixed val cycle ----
+        # 50 train → 50 fixed val cycle
         train_rewards, best_val_50, best_ckpt_path, best_at_ep = env_train.train_validate_cycle(
             agent,
             total_train_episodes=TRAIN_EPISODES_FULL,
@@ -1167,11 +1151,11 @@ if __name__ == "__main__":
 
         t1 = time.time()
 
-        # ---- load best checkpoint ----
+        # load best checkpoint
         agent.model.load_weights(best_ckpt_path)
         agent.target_model.set_weights(agent.model.get_weights())
 
-        # ---- final validation + test ----
+        # final validation + test over full 100 epidodes
         env_val_final = Environment(variant=VARIANT, data_dir=DATA_DIR)
         env_test_final = Environment(variant=VARIANT, data_dir=DATA_DIR)
 
@@ -1212,7 +1196,7 @@ if __name__ == "__main__":
         with open(os.path.join(save_folder, "result.json"), "w") as f:
             json.dump(rec, f, indent=2)
 
-    # ---- summary across seeds ----
+    # summary across seeds
     with open(os.path.join(root_save, "all_results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
