@@ -1,6 +1,5 @@
 
 # FULL SCRIPT incl. visualization (Train/Val/Test raw + 25-MA + benchmark line)
-#
 # WHAT'S IN HERE
 # - PER SumTree replay (NORMAL PER sampling, no hybrid recency)
 # - Double DQN target computation fully in TF (@tf.function) to avoid numpy roundtrips
@@ -10,7 +9,7 @@
 # - Final evaluation returns per episode (val+test arrays) + plot:
 #   * raw returns per episode
 #   * 25-episode moving average per phase
-#   * horizontal benchmark line at 216.9
+#   * horizontal benchmark line at 216.92
 
 # 0) Reproducibility / Quiet logs + Resource-friendly TF
 
@@ -44,21 +43,17 @@ try:
 except Exception:
     pass
 
+#Visualization
 import matplotlib.pyplot as plt
 
-
 # SciPy shortest paths
-
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-
-# Your Environment
-
+# Environment
 from Environment import Environment
 
-
-# TF/Keras
+# Tensorflow/Keras
 from tensorflow.keras import Model, Input
 from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
 from tensorflow.keras.optimizers import Adam
@@ -356,7 +351,7 @@ def encode_obs(obs, env):
    
     # One-step and Two-step lookahead
   
-    # weights (can be tuned)
+    # weights
     W_ITEM = 1.0
     W_BASE = 1.0
     W_PICK = 0.8
@@ -510,7 +505,7 @@ def compute_valid_actions(env):
 
 
 
-# 4) Replay (PER SumTree)
+# 4) Prioritized Replay (PER SumTree)
 
 class SumTree:
     def __init__(self, capacity: int):
@@ -627,7 +622,7 @@ class PrioritizedReplayBuffer:
 
 
 
-# 5) NoisyDense 
+# 5) NoisyDense Layer
 
 class NoisyDense(tf.keras.layers.Layer):
     def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
@@ -691,7 +686,7 @@ class NoisyDense(tf.keras.layers.Layer):
 
 
 
-# 6) DQN Agent (Dueling Double DQN + PER + optional Noisy)
+# 6) DQN Agent (Dueling Double DQN + PER + Noisy)
 
 class DQN_Agent:
     def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
