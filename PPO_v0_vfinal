@@ -1,36 +1,3 @@
-'''
-RESULTS
-Seed 10: 218.720 (runtime = 00:49:12.702)
-Seed 11: 216.675 (runtime = 00:50:51)
-Seed 12: 218.900 (runtime = 00:50:42)
-Seed 13: 218.650 (runtime = 00:47:24)
-Seed 14: 216.625 (runtime = 00:52:19)
-Seed 15: 216.740 (runtime = 00:50:40)
-Seed 16: 217.055 (runtime = 00:53:57)
-Seed 17: 216.335 (runtime = 01:11:51)
-Seed 18: 217.820 (runtime = 00:47:52)
-Seed 19: 213.870 (runtime = 00:55:11)
-
-Mean across 10 seeds = 217.14 (greedy 216.920)
-'''
-
-
-# ============================================================
-# PPO (Standalone, BO-extracted) — SAME algorithm/loop as BO run_one_seed()
-# Style matches your “speed + clean logging” script.
-#
-# No Optuna / no BO call
-# Seed hardcoded in __main__
-# SAME rollout/update/checkpoint-by-validation logic as BO
-# SAME networks, losses, action masking, GAE, annealing scheme as BO code
-# Includes your requested best HPs (below)
-#
-# NOTE: To reproduce BO per-seed numbers, keep:
-# - same env_midterm.py + same ./data
-# - same device type (cuda vs cpu)
-# - same torch version + deterministic settings
-# ============================================================
-
 import os
 import random
 import numpy as np
@@ -38,21 +5,15 @@ import time
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.distributions import Categorical
-
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from env_midterm import Environment
-
-# ============================================================
-# STRICT reproducibility controls (same spirit as BO script)
-# ============================================================
 
 STRICT_DETERMINISM = True
 
@@ -89,10 +50,6 @@ def set_global_seed(seed: int):
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
-# ============================================================
-# Episode CSV caching (transparent, non-algorithmic)
-# ============================================================
-
 _EPISODE_DF_CACHE = {}
 
 try:
@@ -125,20 +82,22 @@ try:
 except Exception:
     pd = None
 
-# ============================================================
-# CNN SHAPE (matches BO)
-# ============================================================
-
+# CNN SHAPE 
 CHANNELS = 10
 HEIGHT = 5
 WIDTH = 5
 N_ACTIONS = 5
 
-# ============================================================
-# Distance structures (matches BO)
-# ============================================================
-
-def _build_distance_structs(env):
+# Distance structures
+def _build_distance_structs(env)
+"""
+Precomputes shortest-path distances on the grid and caches them on env
+Builds the following:
+- _dist_matrix: all-pairs shortest path distances
+- _dist_from_idx_grids: distance-to-cell grids per node
+- _dist_base_grid: distances to base
+- _max_dist: normalized constant
+"""
     if hasattr(env, "_dist_ready") and env._dist_ready:
         return
 
@@ -232,11 +191,12 @@ def _coord_to_idx(env, coord):
         return coord[0] * 5 + coord[1]
     return env._coord_to_idx[coord]
 
-# ============================================================
-# Action masks (matches BO)
-# ============================================================
-
+# Action masking
 def valid_action_mask(env, n_actions=5):
+"""
+Returns a boolean mask of valid actions for the current env state
+Movement actions are valid only if the target cell is inside the grid and eligible/walkable
+"""
     mask = np.zeros(n_actions, dtype=np.bool_)
     mask[0] = True
 
@@ -262,6 +222,11 @@ def valid_action_mask(env, n_actions=5):
     return mask
 
 def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
+"""
+Vectorized action masking for a batch of encoded observations.
+Uses channel 0 (agent position) and channel 6 (eligible mask).
+Returns a [B, n_actions] boolean mask.
+"""
     device = obs_batch.device
     B = obs_batch.shape[0]
 
@@ -308,11 +273,22 @@ def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
 
     return mask
 
-# ============================================================
-# Observation encoding (matches BO)
-# ============================================================
-
+# Observation encoding
 def encode_obs(obs, env, feature_mode="full"):
+"""
+Encodes raw environmet into 10-channel 5x5 grid.
+Channels:
+0 - agent position
+1 - item presence
+2 - item age (normalized)
+3 - distace from agent to cell (normalized)
+4 - distance from base to cell (normalized)
+5 - item time-to-live (TTL) (normalized)
+6 - eligible mask
+7 - normalized step
+8 - normalized load
+9 - potential field / phi plane
+"""
     step, agent_loc, agent_load, item_locs, item_times = obs
     _build_distance_structs(env)
 
@@ -419,11 +395,12 @@ def encode_obs(obs, env, feature_mode="full"):
 
     return state.reshape(-1)
 
-# ============================================================
-# Noisy Linear (matches BO)
-# ============================================================
-
+# Noisy Linear
 class NoisyLinear(nn.Module):
+"""
+Linear layer with factorized Gaussian noise -> Noisy Net.
+Uses deterministic parameters in evaluation mode and adds sampled noise during training.
+"""
     def __init__(self, in_features, out_features, sigma_init=0.35):
         super().__init__()
         self.in_features = in_features
@@ -455,11 +432,12 @@ class NoisyLinear(nn.Module):
         bias = self.mu_bias + self.sigma_bias * eps_b
         return x @ weight + bias
 
-# ============================================================
-# CNN Policy & Value (matches BO)
-# ============================================================
-
+# CNN Policy & Value
 class PolicyNet(nn.Module):
+"""
+CNN policy network: Conv-Conv -> NoisyLinear + LayerNorm -> action logits.
+Input is flattened (C,H,W) observation.
+"""
     def __init__(self, obs_dim, n_actions, hidden_dim=256):
         super().__init__()
         self.channels = CHANNELS
@@ -486,6 +464,10 @@ class PolicyNet(nn.Module):
         return self.logits(x)
 
 class ValueNet(nn.Module):
+"""
+CNN value network: Conv-Conv -> Linear + LayerNorm -> scalar state value.
+Input is a flattened (C,H,W) observation.
+"""
     def __init__(self, obs_dim, hidden_dim=256):
         super().__init__()
         self.channels = CHANNELS
@@ -511,11 +493,11 @@ class ValueNet(nn.Module):
         x = F.relu(x)
         return self.v(x).squeeze(-1)
 
-# ============================================================
-# PPO Rollout Buffer (matches BO)
-# ============================================================
-
+# PPO Rollout Buffer
 class RolloutBuffer:
+"""
+Storage for PPO rollouts which collects transitions and computes GAE advantages and returns.
+"""
     def __init__(self, obs_dim, device):
         self.obs_dim = obs_dim
         self.device = device
@@ -540,6 +522,10 @@ class RolloutBuffer:
         self.bootstraps.append(float(bootstrap_value))
 
     def compute_gae(self, gamma, lam):
+    """
+    Computes GAE and returns.
+    Uses time-limit bootstrapping via stored bootstrap values and returns normalized advantages and value targets.
+    """
         rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
         values  = torch.tensor(self.values,  dtype=torch.float32, device=self.device)
         dones   = torch.tensor(self.dones,   dtype=torch.float32, device=self.device)
@@ -553,8 +539,7 @@ class RolloutBuffer:
 
         for t in reversed(range(T)):
             if dones[t] > 0.5:
-                next_value = boots[t]  # time-limit bootstrap (as BO)
-                # do not reset gae
+                next_value = boots[t]  # time-limit bootstrap
 
             delta = rewards[t] + gamma * next_value - values[t]
             gae = delta + gamma * lam * gae
@@ -572,11 +557,11 @@ class RolloutBuffer:
         old_v = torch.as_tensor(np.asarray(self.values, dtype=np.float32), device=self.device)
         return obs, actions, old_logp, old_v
 
-# ============================================================
-# PPO Agent (matches BO — including annealing rule)
-# ============================================================
-
+# PPO Agent
 class PPOAgent:
+"""
+PPO actor-critic with action masking, clipping, entropy bonus, and value clipping.
+"""
     def __init__(
         self,
         obs_dim,
@@ -594,6 +579,9 @@ class PPOAgent:
         max_grad_norm=0.5,
         vf_clip_ratio=0.2,
     ):
+    """
+    Initializes policy/value networks, optimizers, and PPO hyperparameters.
+    """
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.gamma = float(gamma)
@@ -620,6 +608,9 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, obs_vec, env=None, eval_mode=False):
+    """
+    Sample (train) or greedy-pick (eval) an action from the masked policy and returns (action, log_prob, value).
+    """
         if eval_mode:
             self.policy.eval()
             self.value_fn.eval()
@@ -646,7 +637,9 @@ class PPOAgent:
         return int(action.item()), float(log_prob.item()), float(value.item())
 
     def set_annealed_hparams(self, progress: float):
-        # EXACTLY like BO script
+    """
+    Anneal learning rates, entropy coefficient, and clip ratio over training progress in [0,1].
+    """
         pi_lr = self._pi_lr0 * (1.0 - progress)
         vf_lr = self._vf_lr0 * (1.0 - progress)
         for pg in self.pi_optimizer.param_groups:
@@ -655,10 +648,13 @@ class PPOAgent:
             pg["lr"] = vf_lr
 
         self.entropy_coef = max(0.002, self._ent0 * (1.0 - progress))
-        # BO script uses fixed base constant here (NOT "self.clip_ratio")
         self.clip_ratio = max(0.04, 0.07098308442073593 * (1.0 - 0.5 * progress))
 
     def update(self, obs, actions, old_logp, old_values, advantages, returns):
+    """
+    Runs PPO updates for several epochs over minibatches.
+    Applies policy/value clipping, entropy bonus, gradient clipping, and KL early stop.
+    """
         self.policy.train()
         self.value_fn.train()
 
@@ -682,7 +678,6 @@ class PPOAgent:
 
                 logits = self.policy(mb_obs)
 
-                # IMPORTANT: action masking inside update (as BO)
                 mask = valid_action_mask_from_obs_batch(mb_obs, self.n_actions)
                 logits = logits.masked_fill(~mask, -1e9)
 
@@ -718,10 +713,7 @@ class PPOAgent:
             if len(approx_kls) > 0 and float(np.mean(approx_kls)) > 1.5 * self.target_kl:
                 break
 
-# ============================================================
-# Eval helpers (silent)
-# ============================================================
-
+# Eval helpers
 def run_eval_silent(env, agent, feature_mode, mode, episodes):
     returns = []
     max_eps = min(episodes, len(env.validation_episodes) if mode == "validation" else len(env.test_episodes))
@@ -764,10 +756,7 @@ def summarize_returns(name, returns):
     print(f"Mean return (last {window}): {mean_last:.2f}")
     print("================================\n")
 
-# ============================================================
-# Train + Val + Test (EXACT BO loop structure)
-# ============================================================
-
+# Train + Val + Test
 def train_and_test_ppo(
     data_dir,
     variant=0,
@@ -776,7 +765,7 @@ def train_and_test_ppo(
     validation_episodes=100,
     test_episodes=100,
 
-    # === YOUR REQUESTED BEST HPs ===
+    # Hyperparameters
     gamma=0.9903908067862474,
     lam=0.8445345102837427,
     clip_ratio=0.06462447063962125,
@@ -795,6 +784,10 @@ def train_and_test_ppo(
     ckpt_dir="./checkpoints",
     train_print_every_episodes=250,  # style logging (safe)
 ):
+"""
+Train PPO with rollout-based updates, periodic validation, and best-val checkpointing.
+Returns the trained agent, returns lists, and the checkpoint path.
+"""
     set_global_seed(seed)
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -823,7 +816,6 @@ def train_and_test_ppo(
         vf_clip_ratio=0.2,
     )
 
-    # BO script:
     total_steps_budget = int(train_episodes) * 200
     num_updates = max(1, total_steps_budget // int(rollout_steps))
 
@@ -853,7 +845,6 @@ def train_and_test_ppo(
             done_bool = bool(done_flag)
             ep_ret += rew
 
-            # BO script: bootstrap only when done
             if done_bool:
                 with torch.no_grad():
                     nxt = torch.as_tensor(next_obs_vec, dtype=torch.float32, device=agent.device).unsqueeze(0)
@@ -879,7 +870,6 @@ def train_and_test_ppo(
         adv_t, ret_t = buffer.compute_gae(gamma=agent.gamma, lam=agent.lam)
         agent.update(obs_t, actions_t, old_logp_t, old_v_t, adv_t, ret_t)
 
-        # BO script: validation checkpoint every save_every_updates
         if (update_idx + 1) % int(save_every_updates) == 0 or (update_idx + 1) == num_updates:
             val_env = Environment(variant=variant, data_dir=data_dir)
             val_returns = run_eval_silent(val_env, agent, feature_mode, mode="validation", episodes=validation_episodes)
@@ -909,7 +899,7 @@ def train_and_test_ppo(
                 )
                 print(f"[CKPT] saved new best-val checkpoint -> {best_ckpt_path}")
 
-    # Load best checkpoint (by validation)
+    # Load best checkpoint from validation
     if os.path.exists(best_ckpt_path):
         ckpt = torch.load(best_ckpt_path, map_location=device)
         agent.policy.load_state_dict(ckpt["policy_state_dict"])
@@ -918,7 +908,7 @@ def train_and_test_ppo(
     else:
         print("\nNo BEST checkpoint found; using final weights.\n")
 
-    # Final evaluation (same as BO)
+    # Final evaluation
     val_env = Environment(variant=variant, data_dir=data_dir)
     test_env = Environment(variant=variant, data_dir=data_dir)
 
@@ -943,10 +933,6 @@ def train_and_test_ppo(
 
     return agent, train_returns, val_returns, test_returns, best_ckpt_path
 
-# ============================================================
-# Main (hardcoded seed, style like your file)
-# ============================================================
-
 if __name__ == "__main__":
     DATA_DIR = "./data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -957,7 +943,6 @@ if __name__ == "__main__":
     TEST_EPISODES = 100
     SEED= 19
 
-    # IMPORTANT: same checkpoint dir structure per seed (prevents collisions)
     CKPT_DIR = os.path.join("./checkpoints_bo_extracted", f"seed_{SEED}")
 
     print("\n" + "#" * 70)
@@ -973,7 +958,7 @@ if __name__ == "__main__":
         validation_episodes=VAL_EPISODES,
         test_episodes=TEST_EPISODES,
 
-        # === REQUIRED HPs (as requested) ===
+        # Hyperparameters
         gamma=0.9903908067862474,
         lam=0.8445345102837427,
         clip_ratio=0.06462447063962125,
@@ -1005,6 +990,6 @@ if __name__ == "__main__":
     print(f"[Seed {SEED}] Wall time: {h:02d}:{m:02d}:{s:06.3f}  (hh:mm:ss.sss)")
     benchmark = 216.920
     if test_mean > benchmark:
-        print("YAY YOU BEAT THE BENCHMARK")
+        print("YAY! BEAT THE BENCHMARK")
     else:
-        print("KEEP TRYING - SO CLOSE")
+        print("SO CLOSE")
