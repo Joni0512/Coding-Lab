@@ -1,4 +1,3 @@
-
 import os
 import random
 import numpy as np
@@ -17,10 +16,7 @@ from scipy.sparse.csgraph import dijkstra
 
 from env_midterm import Environment
 
-# ============================================================
 # Reproducibility
-# ============================================================
-
 def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -29,11 +25,11 @@ def set_global_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# ============================================================
 # Action masks
-# ============================================================
-
 def valid_action_mask(env, n_actions=5):
+"""
+Valid actions for current state (idle + moves into eligible cells only).
+"""
     mask = np.zeros(n_actions, dtype=np.bool_)
     mask[0] = True  # idle always allowed
 
@@ -56,8 +52,8 @@ def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
     """
     obs_batch: torch tensor [B, obs_dim] with channels-first encoding (C,H,W) flattened.
     Uses:
-      channel 0: agent position one-hot
-      channel 6: eligible mask
+    channel 0: agent position one-hot
+    channel 6: eligible mask
     Returns: torch.bool tensor [B, n_actions]
     """
     device = obs_batch.device
@@ -114,27 +110,16 @@ def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
 
     return mask
 
-# ============================================================
 # CNN SHAPE
-# ============================================================
-
 CHANNELS = 10
 HEIGHT = 5
 WIDTH = 5
 
-# ============================================================
-# Distance structures (robust mapping for v2)
-# ============================================================
-
+# Distance structures 
 def _build_distance_structs(env):
-    """
-    Builds:
-      env._dist_matrix              [N,N] shortest path distances among eligible nodes
-      env._dist_from_idx_grids      list of grids: for each node idx, grid[r,c]=dist(idx->cell) (only eligible filled)
-      env._dist_base_grid           grid distances to base
-      env._max_dist
-      env._mapping, env._coord_to_idx
-    """
+"""
+Precompute shortest-path distances on the eligible grid and cache them on `env`.
+"""
     if hasattr(env, "_dist_ready") and env._dist_ready:
         return
 
@@ -177,7 +162,6 @@ def _build_distance_structs(env):
         env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
 
     else:
-        # Variant 2: derive mapping from env.eligible_cells to avoid mismatches
         mapping = sorted(list(env.eligible_cells))  # list of (r,c)
         env._mapping = mapping
         env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
@@ -189,7 +173,6 @@ def _build_distance_structs(env):
             neighbor_matrix[a, b] = 1
             neighbor_matrix[b, a] = 1
 
-        # connect manhattan-adjacent eligible cells
         for i, (r1, c1) in enumerate(mapping):
             for j in range(i + 1, n):
                 r2, c2 = mapping[j]
@@ -218,15 +201,18 @@ def _build_distance_structs(env):
     env._dist_ready = True
 
 def _coord_to_idx(env, coord):
+"""
+Map to the node index used by the distance grids.
+"""
     if env.variant in (0, 1):
         return coord[0] * 5 + coord[1]
     return env._coord_to_idx[coord]
 
-# ============================================================
-# Observation encoding (Phi)
-# ============================================================
-
+# Observation encoding
 def encode_obs(obs, env, feature_mode="full"):
+"""
+Encodes env state into 10x5x5, including eligible mask, distances, and phi plane / potential field.
+"""
     step, agent_loc, agent_load, item_locs, item_times = obs
     _build_distance_structs(env)
 
@@ -334,11 +320,11 @@ def encode_obs(obs, env, feature_mode="full"):
 
     return state.reshape(-1)
 
-# ============================================================
 # Networks
-# ============================================================
-
 class PolicyNet(nn.Module):
+"""
+CNN policy network: 3 Conv layers + 2 MLP layers -> action logits.
+"""
     def __init__(self, obs_dim, n_actions, hidden_dim=256):
         super().__init__()
         assert obs_dim == CHANNELS * HEIGHT * WIDTH
@@ -366,6 +352,9 @@ class PolicyNet(nn.Module):
         return self.logits(x)
 
 class ValueNet(nn.Module):
+"""
+CNN value network: 3 Conv layers + 2 MLP layers -> scalar state value.
+"""
     def __init__(self, obs_dim, hidden_dim=256):
         super().__init__()
         assert obs_dim == CHANNELS * HEIGHT * WIDTH
@@ -392,11 +381,11 @@ class ValueNet(nn.Module):
         x = F.relu(self.ln2(self.fc2(x)))
         return self.v(x).squeeze(-1)
 
-# ============================================================
 # PPO Buffer
-# ============================================================
-
 class PPOBuffer:
+"""
+Rollout buffer for PPO with GAE and return computation.
+"""
     def __init__(self, obs_dim, device):
         self.obs_dim = obs_dim
         self.device = device
@@ -421,6 +410,9 @@ class PPOBuffer:
         self.next_values.append(float(next_value))
 
     def compute_advantages(self, gamma, lam, reward_norm=True):
+    """
+    Compute GAE advantages and value targets.
+    """
         rewards = torch.tensor(self.rewards, dtype=torch.float32, device=self.device)
         values = torch.tensor(self.values, dtype=torch.float32, device=self.device)
         next_values = torch.tensor(self.next_values, dtype=torch.float32, device=self.device)
@@ -451,10 +443,7 @@ class PPOBuffer:
         old_values = torch.as_tensor(np.asarray(self.values, dtype=np.float32), device=self.device)
         return obs, actions, old_log_probs, old_values, self.advantages, self.returns
 
-# ============================================================
 # PPO Agent
-# ============================================================
-
 class PPOAgent:
     def __init__(
         self,
@@ -476,6 +465,9 @@ class PPOAgent:
         total_updates=1,
         eps_mix=0.0,  # <<< epsilon-mix exploration probability (train only)
     ):
+    """
+    PPO actor-critic with action masking, entropy / LR annealing, and optional epsilon-mix exploration.
+    """
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.gamma = float(gamma)
@@ -514,6 +506,9 @@ class PPOAgent:
                 p.requires_grad = bool(trainable)
 
     def _anneal(self):
+    """
+    Anneal actor / critic learning rates and entropy coefficient over updates.
+    """
         frac = min(1.0, self.update_count / float(self.total_updates))
 
         lr_mult = 1.0 - 0.7 * frac
@@ -527,6 +522,10 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, obs_vec, env=None, eval_mode=False):
+    """
+    Choose an action from masked logits (sample in train, argmax in eval).
+    Optionally uses epsilon-mix random valid actions during training.
+    """
         if eval_mode:
             self.policy.eval()
             self.value_fn.eval()
@@ -544,7 +543,7 @@ class PPOAgent:
 
         dist = Categorical(logits=logits)
 
-        # --- epsilon-mix exploration (TRAIN ONLY) ---
+        # epsilon-mix exploration
         if (not eval_mode) and (env is not None) and (self.eps_mix > 0.0):
             if random.random() < self.eps_mix:
                 valid = np.where(mask_np)[0] if 'mask_np' in locals() else np.where(valid_action_mask(env, self.n_actions))[0]
@@ -553,7 +552,6 @@ class PPOAgent:
                 log_prob = dist.log_prob(a_t)
                 value = self.value_fn(obs_t)
                 return a, float(log_prob.item()), float(value.item())
-        # -------------------------------------------
 
         action = torch.argmax(dist.probs, dim=-1) if eval_mode else dist.sample()
         log_prob = dist.log_prob(action)
@@ -561,6 +559,9 @@ class PPOAgent:
         return int(action.item()), float(log_prob.item()), float(value.item())
 
     def update(self, buffer: PPOBuffer):
+    """
+    PPO update on one rollout: minibatches, clipping, entropy bonus, value clipping, KL early stop.
+    """
         self.policy.train()
         self.value_fn.train()
 
@@ -623,10 +624,7 @@ class PPOAgent:
 
         self.update_count += 1
 
-# ============================================================
 # Evaluation
-# ============================================================
-
 def run_eval(agent, data_dir, variant, feature_mode, mode, episodes):
     if mode not in ("validation", "testing"):
         raise ValueError(f"mode must be 'validation' or 'testing', got: {mode}")
@@ -669,10 +667,7 @@ def summarize_returns(name, returns):
     print(f"Best episode return:         {float(arr.max()):.2f}")
     print("================================\n")
 
-# ============================================================
-# Visualization (live)
-# ============================================================
-
+# Visualization
 def visualize_episode(env, agent, feature_mode="full", mode="testing", max_steps=200, pause=0.06, title_prefix=""):
     raw = env.reset(mode=mode)
     obs_vec = encode_obs(raw, env, feature_mode=feature_mode)
@@ -746,10 +741,7 @@ def visualize_episode(env, agent, feature_mode="full", mode="testing", max_steps
 
     plt.show()
 
-# ============================================================
-# Animation saving (macOS Retina safe)
-# ============================================================
-
+# Animation saving
 def save_episode_animation(env, agent, feature_mode="full", mode="testing",
                            max_steps=200, out_path="episode.gif", fps=12):
     raw = env.reset(mode=mode)
@@ -862,10 +854,7 @@ def save_episode_animation(env, agent, feature_mode="full", mode="testing",
 
     print(f"Saved animation to: {out_path}")
 
-# ============================================================
-# Train + Val + Test (using best-val checkpoint)
-# ============================================================
-
+# Train + Val + Test
 def train_and_test_ppo(
     data_dir,
     variant=2,
@@ -896,6 +885,9 @@ def train_and_test_ppo(
     init_weights_path=None,
     freeze_conv_updates=0,
 ):
+"""
+Train PPO with best-val checkpointing, optional init/freeze, and optional viz/animation.
+"""
     set_global_seed(seed)
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs("./code_data/plots", exist_ok=True)
@@ -930,7 +922,6 @@ def train_and_test_ppo(
         eps_mix=eps_mix,
     )
 
-    # Optional weight init (transfer learning)
     if init_weights_path is not None and os.path.exists(init_weights_path):
         ck = torch.load(init_weights_path, map_location=device)
         agent.policy.load_state_dict(ck["policy_state_dict"])
@@ -1044,7 +1035,6 @@ def train_and_test_ppo(
     else:
         print("\nNo BEST-VAL checkpoint found; using final weights.\n")
 
-    # Save one episode as GIF
     if save_animation:
         viz_env = Environment(variant=variant, data_dir=data_dir)
         save_episode_animation(
@@ -1056,7 +1046,6 @@ def train_and_test_ppo(
             fps=10,
         )
 
-    # Final evaluation on fresh envs
     val_returns = run_eval(agent, data_dir, variant, feature_mode, mode="validation", episodes=validation_episodes)
     test_returns = run_eval(agent, data_dir, variant, feature_mode, mode="testing", episodes=test_episodes)
 
@@ -1078,10 +1067,6 @@ def train_and_test_ppo(
     return agent, train_returns, val_returns, test_returns, best_ckpt_path
 
 
-# ============================================================
-# Main (v8: epsilon-mix only)
-# ============================================================
-
 if __name__ == "__main__":
     DATA_DIR = "./data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1092,7 +1077,7 @@ if __name__ == "__main__":
     TEST_EPISODES = 100
     SEED= 19
 
-    EPS_MIX = 0.08  # try 0.05–0.15 (train only)
+    EPS_MIX = 0.08 
 
     print("\n" + "#" * 70)
     print(f"### Starting PPO v8 (epsilon-mix) seed={SEED} (VARIANT={VARIANT})")
