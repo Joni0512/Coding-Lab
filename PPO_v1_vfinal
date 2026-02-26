@@ -1,27 +1,3 @@
-'''
-
-Using env_midterm
-
-Greedy: 384.255
-
-RESULTS
-Seed 10: 389.945 (runtime = 00:31:13)
-Seed 11: 393.840 (runtime = 00:32:34)
-Seed 12: 386.970 (runtime = 00:30:34)
-Seed 13: 390.615 (runtime = 00:31:0)
-Seed 14: 384.890 (runtime = 00:30:32)
-Seed 15: 388.400 (runtime = 00:30:42)
-Seed 16: 385.965 (runtime = 00:30:52)
-Seed 17: (runtime =)
-Seed 18: (runtime =)
-Seed 19: (runtime =)
-
-Option 1 Phi-Plane
-
-'''
-# PPO Variant 1 (capacity=3) — stabilized PPO + capacity-aware shaping features
-# Copy-paste as a single file (expects env_midterm.py providing Environment)
-
 import os
 import random
 import numpy as np
@@ -38,10 +14,8 @@ from scipy.sparse.csgraph import dijkstra
 
 from env_midterm import Environment
 
-# ============================================================
-# Utilities
-# ============================================================
 
+# Utilities
 def set_global_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -51,6 +25,10 @@ def set_global_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 def valid_action_mask(env, n_actions=5):
+"""
+Valid action masking for the current env state.
+Moves only into eligible / walkable cells.
+"""
     mask = np.zeros(n_actions, dtype=np.bool_)
     mask[0] = True  # idle always allowed
 
@@ -72,11 +50,8 @@ def valid_action_mask(env, n_actions=5):
 
 def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
     """
-    obs_batch: torch tensor [B, obs_dim] with channels-first encoding (C,H,W) flattened.
-    Uses:
-      channel 0: agent position one-hot
-      channel 6: eligible mask
-    Returns: torch.bool tensor [B, n_actions]
+    Batches action masks from encoded observations.
+    Uses channel 0 (agent) and 6 (eligible).
     """
     device = obs_batch.device
     B = obs_batch.shape[0]
@@ -132,19 +107,16 @@ def valid_action_mask_from_obs_batch(obs_batch, n_actions=5):
 
     return mask
 
-# ============================================================
 # CNN SHAPE
-# ============================================================
-
 CHANNELS = 10
 HEIGHT = 5
 WIDTH = 5
 
-# ============================================================
 # Distance structures
-# ============================================================
-
 def _build_distance_structs(env):
+"""
+Precompute and cache shortest-path distanced (agent / base) for observation encoding.
+"""
     if hasattr(env, "_dist_ready") and env._dist_ready:
         return
 
@@ -232,15 +204,17 @@ def _build_distance_structs(env):
     env._dist_ready = True
 
 def _coord_to_idx(env, coord):
+"""
+Map to the node index used in the distance arrays.
+"""
     if env.variant in (0, 1):
         return coord[0] * 5 + coord[1]
     return env._coord_to_idx[coord]
 
-# ============================================================
-# PPO observation encoding (CHW flatten) — capacity-aware Φ
-# ============================================================
-
 def encode_obs(obs, env, feature_mode="full"):
+"""
+Encodes env state into a 10x5x5 CNN input with distances, masks and a load-aware phi plane / potential field
+"""
     step, agent_loc, agent_load, item_locs, item_times = obs
 
     _build_distance_structs(env)
@@ -311,17 +285,11 @@ def encode_obs(obs, env, feature_mode="full"):
 
     # base and item terms (same structure across regimes)
     base_term = -1.2 * d_base
-
-    # item_term uses full plane distance-to-agent plus a scalar urgency component
-    # (scalar broadcasts across grid)
     item_term = -1.0 * d_agent + 1.3 * (1.0 - best_ttl)
 
-    # load buckets for capacity=3 (works for other caps too)
     cap = float(env.agent_capacity)
     load = float(agent_load)
 
-    # regime weights (alpha = weight on going home)
-    # tuned for v1 batching: load=1 still mostly collect, load=2 mostly deposit, full = deposit hard
     if load <= 0:
         alpha = 0.00
         detour_penalty = 1.0
@@ -337,16 +305,13 @@ def encode_obs(obs, env, feature_mode="full"):
         alpha = 1.00
         detour_penalty = 1.8
 
-    # strengthen "don't wander" as load increases by increasing distance penalty in item term
     item_term = -detour_penalty * d_agent + 1.3 * (1.0 - best_ttl)
 
-    # mix
     phi_plane = (1.0 - alpha) * item_term + alpha * base_term
 
     phi_plane = np.clip(phi_plane, -1.0, 1.0)
     state[9, :, :] = phi_plane
 
-    # feature_mode toggles (keep yours)
     fm = feature_mode
     if fm == "full":
         pass
@@ -373,11 +338,12 @@ def encode_obs(obs, env, feature_mode="full"):
 
     return state.reshape(-1)
 
-# ============================================================
 # CNN Policy & Value (NO NoisyLinear in actor)
-# ============================================================
-
 class PolicyNet(nn.Module):
+"""
+CNN policy network: 3 conv layers + 2 MLP layers -> action logits
+No noisy linear (deterministic actor).
+"""
     def __init__(self, obs_dim, n_actions, hidden_dim=256):
         super().__init__()
         self.channels = CHANNELS
@@ -408,6 +374,9 @@ class PolicyNet(nn.Module):
         return self.logits(x)
 
 class ValueNet(nn.Module):
+"""
+CNN value network: 3 conv layers + 2 MLP layers -> scalar state value.
+"""
     def __init__(self, obs_dim, hidden_dim=256):
         super().__init__()
         self.channels = CHANNELS
@@ -437,11 +406,11 @@ class ValueNet(nn.Module):
         x = F.relu(self.ln2(self.fc2(x)))
         return self.v(x).squeeze(-1)
 
-# ============================================================
-# PPO Buffer (reward norm + correct GAE + episode reset)
-# ============================================================
-
+# PPO Buffer 
 class PPOBuffer:
+"""
+Rollout storage for PPO (states, actions, rewards, values) with GAE computation.
+"""
     def __init__(self, obs_dim, device):
         self.obs_dim = obs_dim
         self.device = device
@@ -454,7 +423,7 @@ class PPOBuffer:
         self.dones = []
         self.log_probs = []
         self.values = []
-        self.last_values = []  # V(s_{t+1}) for each step
+        self.last_values = []  
 
     def store(self, obs, action, reward, done, log_prob, value, next_value):
         self.obs.append(np.array(obs, dtype=np.float32))
@@ -482,7 +451,6 @@ class PPOBuffer:
 
         gae = 0.0
         for t in reversed(range(T)):
-            # reset at episode boundary (important because buffer spans multiple episodes)
             if dones[t] > 0.5:
                 gae = 0.0
 
@@ -506,10 +474,7 @@ class PPOBuffer:
 
         return obs, actions, old_log_probs, old_values, self.advantages, self.returns
 
-# ============================================================
-# PPO Agent (LR anneal + entropy decay)
-# ============================================================
-
+# PPO Agent
 class PPOAgent:
     def __init__(
         self,
@@ -530,6 +495,9 @@ class PPOAgent:
         vf_clip_ratio=0.2,
         total_updates=1,
     ):
+    """
+    PPO actor-critic with action masking, clipping, entropy schedule, and value clipping.
+    """
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.gamma = float(gamma)
@@ -559,6 +527,9 @@ class PPOAgent:
         self.update_count = 0
 
     def _anneal(self):
+    """
+    Update LR schedule and entropy coefficient based on training progress.
+    """
         # linear annealing from 1.0 -> 0.3
         frac = min(1.0, self.update_count / float(self.total_updates))
         lr_mult = 1.0 - 0.7 * frac
@@ -573,6 +544,10 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, obs_vec, env=None, eval_mode=False):
+    """
+    Pick an action from the masked policy (sample in train, argmax in eval).
+    Returns (action, log_prob, value).
+    """
         if eval_mode:
             self.policy.eval()
             self.value_fn.eval()
@@ -601,6 +576,9 @@ class PPOAgent:
         return int(action.item()), float(log_prob.item()), float(value.item())
 
     def update(self, buffer: PPOBuffer):
+    """
+    Run PPO updates on one rollout: minibatches, clipping, entropy bonus, KL early stop.
+    """
         self.policy.train()
         self.value_fn.train()
 
@@ -670,10 +648,7 @@ class PPOAgent:
 
         self.update_count += 1
 
-# ============================================================
 # Train + Val + Test
-# ============================================================
-
 def run_eval_silent(env, agent, feature_mode, mode, episodes):
     returns = []
     max_eps = min(episodes, len(env.validation_episodes) if mode == "validation" else len(env.test_episodes))
@@ -742,6 +717,9 @@ def train_and_test_ppo(
     # rollout param
     rollout_episodes_per_update=16,
 ):
+"""
+Train PPO with rollouts, periodic validation, and best-val checkpoint saving.
+"""
     set_global_seed(seed)
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -820,7 +798,6 @@ def train_and_test_ppo(
             episodes_in_rollout = 0
             update_idx += 1
 
-            # Validation checkpointing in time intervals (like your v0 script)
             if (update_idx) % int(save_every) == 0 or (ep == train_episodes - 1):
                 val_env = Environment(variant=variant, data_dir=data_dir)
                 val_returns = run_eval_silent(val_env, agent, feature_mode, mode="validation", episodes=validation_episodes)
@@ -866,7 +843,7 @@ def train_and_test_ppo(
     else:
         print("\nNo BEST checkpoint found; using final training weights.\n")
 
-    # Final evaluation (silent, like v0 style)
+    # Final evaluation
     val_env = Environment(variant=variant, data_dir=data_dir)
     test_env = Environment(variant=variant, data_dir=data_dir)
 
@@ -946,6 +923,6 @@ if __name__ == "__main__":
 
     benchmark = 385.425
     if test_mean > benchmark:
-        print("YAY YOU BEAT THE BENCHMARK")
+        print("YAY! BEAT THE BENCHMARK")
     else:
         print("Not yet above benchmark.")
