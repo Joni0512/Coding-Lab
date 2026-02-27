@@ -12,7 +12,7 @@ import faulthandler; faulthandler.enable()
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from env_midterm import env_midterm
+from env_midterm import Environment
 
 from tensorflow.keras import Model, Input
 from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
