@@ -1,8 +1,5 @@
 
 
-from datetime import datetime
-import time
-
 import os
 import random
 import warnings
@@ -1071,7 +1068,7 @@ class DQN_Agent:
             return q
 
         q = Lambda(gather_agent_q, name="q_agent")([q_map, agent_layer])
-
+    
         model = Model(inputs=inp, outputs=q)
         model.compile(
             optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
@@ -1285,14 +1282,7 @@ def run_one(seed: int,
       - val_returns (final, full set)
       - test_returns (final, full set)
     """
-    run_start_wall = datetime.now()
-    run_start_perf = time.perf_counter()
-
-    print(f"[TIME] Seed {seed} START: {run_start_wall.strftime('%Y-%m-%d %H:%M:%S')}")
     set_global_seed(seed)
-
-
-    
     VARIANT = 2
 
     BASE_CONFIG = dict(
@@ -1384,12 +1374,7 @@ def run_one(seed: int,
     print(f"[FINAL] Validation avg over {val_final_episodes}: {val_mean:.3f}")
     print(f"[FINAL] Test       avg over {test_final_episodes}: {test_mean:.3f}")
     print(f"[FINAL] Best weights used: {os.path.basename(best_ckpt_path)} (saved in {save_folder})")
-    run_end_wall = datetime.now()
-    run_end_perf = time.perf_counter()
-    run_total = run_end_perf - run_start_perf
-
-    print(f"[TIME] Seed {seed} END  : {run_end_wall.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[TIME] Seed {seed} TOTAL: {format_seconds(run_total)}")
+    
 
     return train_rewards, val_returns, test_returns
 
