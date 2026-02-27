@@ -1221,7 +1221,7 @@ if __name__ == "__main__":
 
     val_returns = evaluate_on_env(agent, env_val, VAL_EPISODES_FINAL, "validation", True)
     test_returns = evaluate_on_env(agent, env_test, TEST_EPISODES_FINAL, "testing", True)
-        plot_train_val_test(
+    plot_train_val_test(
         train_returns=train_rewards,
         val_returns=val_returns,
         test_returns=test_returns,
