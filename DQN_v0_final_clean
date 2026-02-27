@@ -1,16 +1,4 @@
 
-# FULL SCRIPT incl. visualization (Train/Val/Test raw + 25-MA + benchmark line)
-# WHAT'S IN HERE
-# - PER SumTree replay (NORMAL PER sampling, no hybrid recency)
-# - Double DQN target computation fully in TF (@tf.function) to avoid numpy roundtrips
-# - Optional NoisyDense (use_noisy=True/False)
-# - Action masking (invalid moves get -1e9 for argmax selection + target)
-# - Best checkpoint selected by validation average during training
-# - Final evaluation returns per episode (val+test arrays) + plot:
-#   * raw returns per episode
-#   * 25-episode moving average per phase
-#   * horizontal benchmark line at 216.92
-
 # 0) Reproducibility / Quiet logs + Resource-friendly TF
 
 import os
@@ -132,14 +120,14 @@ def plot_train_val_test(train_returns, val_returns, test_returns,
 # 1) Distance structures + caches
 
 def _build_distance_structs(env):
-"""
-Precomputes shortest-path distances on the grid and caches them on env
-Builds the following:
-- _dist_matrix: all-pairs shortest path distances
-- _dist_from_idx_grids: distance-to-cell grids per node
-- _dist_base_grid: distances to base
-- _max_dist: normalized constant
-"""
+        """
+        Precomputes shortest-path distances on the grid and caches them on env
+        Builds the following:
+        - _dist_matrix: all-pairs shortest path distances
+        - _dist_from_idx_grids: distance-to-cell grids per node
+        - _dist_base_grid: distances to base
+        - _max_dist: normalized constant
+        """
     if hasattr(env, "_dist_ready") and env._dist_ready:
         return
 
@@ -494,14 +482,14 @@ def encode_obs(obs, env):
 # 3) Action masking helper
 
 def compute_valid_actions(env):
-   """
-    Returns array of valid action indices for the current env state.
+        """
+        Returns array of valid action indices for the current env state.
 
-    Action 0 (idle) is always valid.
-    Movement actions (1-4) are valid only if:
-        - target cell is inside grid bounds
-        - target cell is eligible / walkable
-    """
+        Action 0 (idle) is always valid.
+        Movement actions (1-4) are valid only if:
+            - target cell is inside grid bounds
+            - target cell is eligible / walkable
+        """
     _build_distance_structs(env)
 
     valid = [0]
@@ -563,12 +551,12 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-    """
-    Prioritized Experience Replay buffer (PER) backed by a SumTree.
+        """
+        Prioritized Experience Replay buffer (PER) backed by a SumTree.
 
-    Stores transitions and samples them proportional to priority (|TD-error|^alpha).
-    Returns importance-sampling weights (beta-annealed) to correct sampling bias.
-    """
+        Stores transitions and samples them proportional to priority (|TD-error|^alpha).
+        Returns importance-sampling weights (beta-annealed) to correct sampling bias.
+        """
     def __init__(self, state_dim, capacity=20_000, alpha=0.6, beta0=0.4,
                  beta_final=1.0, beta_anneal_steps=200_000, eps=1e-6):
         self.capacity = int(capacity)
@@ -653,16 +641,17 @@ class PrioritizedReplayBuffer:
 
 
 # 5) NoisyDense Layer
-    """
-    Noisy linear layer for exploration (NoisyNet).
-
-    Replaces deterministic Dense layers by injecting learnable
-    parameter noise into weights and biases during training.
-
-    - Training: stochastic forward pass (exploration)
-    - Inference: deterministic (uses mean parameters only)
-    """
+  
 class NoisyDense(tf.keras.layers.Layer):
+        """
+        Noisy linear layer for exploration (NoisyNet).
+
+        Replaces deterministic Dense layers by injecting learnable
+        parameter noise into weights and biases during training.
+
+        - Training: stochastic forward pass (exploration)
+        - Inference: deterministic (uses mean parameters only)
+        """
     def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
         super().__init__(**kwargs)
         self.units = int(units)
@@ -1098,10 +1087,7 @@ class GymEnvironment:
         return rew
 
     def train_validate_cycle(
-        """
-        Trains in chunks, validates after each chunk, and saves the
-        best-performing checkpoint based on validation average.
-        """
+    
         self,
         agent,
         total_train_episodes,
@@ -1112,6 +1098,10 @@ class GymEnvironment:
         update_every=4,
         per_update_steps=1,
     ):
+        """
+        Trains in chunks, validates after each chunk, and saves the
+        best-performing checkpoint based on validation average.
+        """
         os.makedirs(self.save_path, exist_ok=True)
         env_val = Environment(self.variant, data_dir)
 
