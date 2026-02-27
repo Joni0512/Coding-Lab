@@ -83,7 +83,7 @@ def set_global_seed(seed: int):
 
 
 def format_seconds(sec: float) -> str:
-     """
+    """
     Pretty-print a duration in seconds.
 
     Returns:
@@ -101,7 +101,7 @@ def format_seconds(sec: float) -> str:
 
 # 1. Distance structures
 def _build_distance_structs(env):
-     """
+    """
     Build and cache shortest-path distances for the current environment.
 
     Caches on `env`:
@@ -358,7 +358,7 @@ def encode_obs(obs, env):
 # 3. Renderer (optional)
 
 class PrettyRenderer:
-     """
+    """
     Lightweight live renderer for debugging episodes (optional).
 
     Shows:
@@ -445,7 +445,7 @@ class PrettyRenderer:
 # 4. Action masking helper  [SPEEDUP: cached eligible set]
 
 def compute_valid_actions(env):
-     """
+    """
     Compute valid actions for the current agent state.
 
     Rules:
@@ -911,7 +911,7 @@ class DQN_Agent:
       - Mask invalid actions (env holes / borders) in acting + bootstrapping
       - CNN + masked ConvLSTM planner head with spatial dueling (V-map + A-map)
       - Optional: n-step returns, NoisyDense exploration
-    ""
+    """
     def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
         if agent_hyperparameters is None:
             agent_hyperparameters = {}
@@ -1176,7 +1176,7 @@ class DQN_Agent:
 # 9) Evaluation helper
 
 def evaluate_on_env(agent, env, episodes=100, mode="testing", return_all=False):
-     """
+    """
     Evaluate a trained agent without exploration.
 
     Behavior:
