@@ -1086,8 +1086,7 @@ def evaluate_on_env_returns(agent, env, episodes=100, mode="validation"):
     return returns
 
 
-# 9) MAIN
-    """Train in chunks with validation checkpoints, then evaluate best model on val/test and save results."""
+# 9) MAIN : train in chunks, select best checkpoint on fixed val, then evaluate on full val/test
 
 if __name__ == "__main__":
     import json
