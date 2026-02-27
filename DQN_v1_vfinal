@@ -26,7 +26,67 @@ warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
 matplotlib.rcParams["axes.unicode_minus"] = False
 
+import matplotlib.pyplot as plt
 
+# Plot helpers
+def moving_average(x, window=25):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < window:
+        return None
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(x, kernel, mode="valid")
+
+def plot_train_val_test(train_returns, val_returns, test_returns,
+                        benchmark=216.9, ma_window=25,
+                        title="DQN Returns", save_path=None, show=True):
+    train_returns = np.asarray(train_returns, dtype=np.float32)
+    val_returns   = np.asarray(val_returns, dtype=np.float32)
+    test_returns  = np.asarray(test_returns, dtype=np.float32)
+
+    x_train = np.arange(1, len(train_returns) + 1)
+    x_val_start = len(train_returns) + 1
+    x_val = np.arange(x_val_start, x_val_start + len(val_returns))
+    x_test_start = len(train_returns) + len(val_returns) + 1
+    x_test = np.arange(x_test_start, x_test_start + len(test_returns))
+
+    plt.figure()
+    if len(train_returns) > 0:
+        plt.plot(x_train, train_returns, label="Train (raw)")
+    if len(val_returns) > 0:
+        plt.plot(x_val, val_returns, label="Validation (raw, greedy)")
+    if len(test_returns) > 0:
+        plt.plot(x_test, test_returns, label="Test (raw, greedy)")
+
+    ma_tr = moving_average(train_returns, window=ma_window)
+    if ma_tr is not None:
+        plt.plot(np.arange(ma_window, len(train_returns) + 1), ma_tr, label=f"Train {ma_window}-MA")
+
+    ma_val = moving_average(val_returns, window=ma_window)
+    if ma_val is not None:
+        plt.plot(np.arange(x_val_start + (ma_window - 1), x_val_start + len(val_returns)), ma_val, label=f"Val {ma_window}-MA")
+
+    ma_te = moving_average(test_returns, window=ma_window)
+    if ma_te is not None:
+        plt.plot(np.arange(x_test_start + (ma_window - 1), x_test_start + len(test_returns)), ma_te, label=f"Test {ma_window}-MA")
+
+    plt.axhline(y=benchmark, linestyle="--", label=f"Benchmark {benchmark:.1f}")
+    if len(val_returns) > 0:
+        plt.axvline(x=len(train_returns), linestyle=":")
+    if len(test_returns) > 0:
+        plt.axvline(x=len(train_returns) + len(val_returns), linestyle=":")
+
+    plt.xlabel("Episode (Train + Val + Test)")
+    plt.ylabel("Return")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+
+    if show:
+        plt.show()
+    plt.close()
 
 # Defaults
 DATA_DIR_DEFAULT = "./data"
@@ -1190,6 +1250,15 @@ if __name__ == "__main__":
             env_test_final,
             episodes=TEST_EPISODES_FINAL,
             mode="testing",
+        )
+        plot_train_val_test(
+          train_returns=train_rewards,
+          val_returns=val_returns,
+          test_returns=test_returns,
+          benchmark=384.255, 
+          ma_window=25,
+          title=f"Variant {VARIANT} | gamma=0.929 | seed={seed}",
+          save_path=os.path.join(save_folder, "returns_plot.png")  # <- pro Seed gespeichert
         )
 
         rec = dict(
