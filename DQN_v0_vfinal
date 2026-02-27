@@ -37,7 +37,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 # Environment
-from Environment import Environment
+from env_midterm import Environment
 
 # Tensorflow/Keras
 from tensorflow.keras import Model, Input
