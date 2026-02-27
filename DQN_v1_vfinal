@@ -1258,7 +1258,7 @@ if __name__ == "__main__":
           benchmark=384.255, 
           ma_window=25,
           title=f"Variant {VARIANT} | gamma=0.929 | seed={seed}",
-          save_path=os.path.join(save_folder, "returns_plot.png")  # <- pro Seed gespeichert
+          save_path=os.path.join(save_folder, "returns_plot.png")
         )
 
         rec = dict(
