@@ -59,7 +59,7 @@ def moving_average(x, window=25):
 
 
 def plot_train_val_test(train_returns, val_returns, test_returns,
-                        benchmark=216.9, ma_window=25,
+                        benchmark=216.92, ma_window=25,
                         title="DQN Returns"):
     train_returns = np.asarray(train_returns, dtype=np.float32)
     val_returns   = np.asarray(val_returns, dtype=np.float32)
