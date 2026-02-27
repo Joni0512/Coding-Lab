@@ -15,7 +15,7 @@ import tensorflow as tf
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from Environment import Environment
+from env_midterm import Environment
 
 from tensorflow.keras import Model, Input
 from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
@@ -25,6 +25,48 @@ from tensorflow.keras.losses import Huber
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+# Plot helpers
+def moving_average(x, window=25):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < window:
+        return None
+    return np.convolve(x, np.ones(window, dtype=np.float32)/window, mode="valid")
+
+def plot_train_val_test(train_returns, val_returns, test_returns,
+                        benchmark=None, ma_window=25, title="Returns",
+                        save_path=None, show=False):
+    train_returns = np.asarray(train_returns, dtype=np.float32)
+    val_returns   = np.asarray(val_returns, dtype=np.float32)
+    test_returns  = np.asarray(test_returns, dtype=np.float32)
+
+    x_train = np.arange(1, len(train_returns)+1)
+    x_val   = np.arange(len(train_returns)+1, len(train_returns)+len(val_returns)+1)
+    x_test  = np.arange(len(train_returns)+len(val_returns)+1,
+                        len(train_returns)+len(val_returns)+len(test_returns)+1)
+
+    plt.figure()
+    if len(train_returns): plt.plot(x_train, train_returns, label="Train")
+    if len(val_returns):   plt.plot(x_val,   val_returns,   label="Val (greedy)")
+    if len(test_returns):  plt.plot(x_test,  test_returns,  label="Test (greedy)")
+
+    ma = moving_average(train_returns, ma_window)
+    if ma is not None:
+        plt.plot(np.arange(ma_window, len(train_returns)+1), ma, label=f"Train {ma_window}-MA")
+
+    if benchmark is not None:
+        plt.axhline(benchmark, linestyle="--", label=f"Benchmark {benchmark:.1f}")
+
+    plt.xlabel("Episode (Train+Val+Test)")
+    plt.ylabel("Return")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
 
 # Silence common matplotlib noise (fonts / backend warnings)
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
@@ -50,7 +92,7 @@ DEFAULT_SEED = 17
 
 HEIGHT = 5
 WIDTH = 5
-CHANNELS = 10  # 0..8 + 9=Phi
+CHANNELS = 10  
 NO_OF_ACTIONS = 5
 
 
@@ -1142,7 +1184,7 @@ class DQN_Agent:
         NEG_INF = tf.constant(-1e9, dtype=tf.float32)
 
         # online argmax
-        q_next_online_tf = self.model(NS_tf, training=Falsinge)  # (B, A)
+        q_next_online_tf = self.model(NS_tf, training=False)  # (B, A)
         q_next_online_tf = tf.where(valid_mask_tf, q_next_online_tf, NEG_INF)
         best_next_actions_tf = tf.argmax(q_next_online_tf, axis=1, output_type=tf.int32)
 
@@ -1325,6 +1367,16 @@ def run_one(seed: int,
                                   mode="validation", return_all=True)
     test_returns = evaluate_on_env(agent, env_test_final, episodes=int(test_final_episodes),
                                    mode="testing", return_all=True)
+    plot_train_val_test(
+        train_returns=train_rewards,
+        val_returns=val_returns,
+        test_returns=test_returns,
+        benchmark=249.75,
+        ma_window=25,
+        title=f"Variant {VARIANT} | seed={seed}",
+        save_path=os.path.join(save_folder, "returns_plot.png"),
+        show=False
+    )
 
     val_mean = float(np.mean(val_returns))
     test_mean = float(np.mean(test_returns))
