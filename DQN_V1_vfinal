@@ -1,0 +1,1327 @@
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import random
+import warnings
+from collections import deque
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+import faulthandler; faulthandler.enable()
+
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import dijkstra
+
+from env_midterm import Environment
+
+from tensorflow.keras import Model, Input
+from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import Huber
+
+
+import matplotlib
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+matplotlib.rcParams["font.family"] = "DejaVu Sans"
+matplotlib.rcParams["axes.unicode_minus"] = False
+
+import matplotlib.pyplot as plt
+
+# Plot helpers
+def moving_average(x, window=25):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < window:
+        return None
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(x, kernel, mode="valid")
+
+def plot_train_val_test(train_returns, val_returns, test_returns,
+                        benchmark=384.55, ma_window=25,
+                        title="DQN Returns", save_path=None, show=True):
+    train_returns = np.asarray(train_returns, dtype=np.float32)
+    val_returns   = np.asarray(val_returns, dtype=np.float32)
+    test_returns  = np.asarray(test_returns, dtype=np.float32)
+
+    x_train = np.arange(1, len(train_returns) + 1)
+    x_val_start = len(train_returns) + 1
+    x_val = np.arange(x_val_start, x_val_start + len(val_returns))
+    x_test_start = len(train_returns) + len(val_returns) + 1
+    x_test = np.arange(x_test_start, x_test_start + len(test_returns))
+
+    plt.figure()
+    if len(train_returns) > 0:
+        plt.plot(x_train, train_returns, label="Train (raw)")
+    if len(val_returns) > 0:
+        plt.plot(x_val, val_returns, label="Validation (raw, greedy)")
+    if len(test_returns) > 0:
+        plt.plot(x_test, test_returns, label="Test (raw, greedy)")
+
+    ma_tr = moving_average(train_returns, window=ma_window)
+    if ma_tr is not None:
+        plt.plot(np.arange(ma_window, len(train_returns) + 1), ma_tr, label=f"Train {ma_window}-MA")
+
+    ma_val = moving_average(val_returns, window=ma_window)
+    if ma_val is not None:
+        plt.plot(np.arange(x_val_start + (ma_window - 1), x_val_start + len(val_returns)), ma_val, label=f"Val {ma_window}-MA")
+
+    ma_te = moving_average(test_returns, window=ma_window)
+    if ma_te is not None:
+        plt.plot(np.arange(x_test_start + (ma_window - 1), x_test_start + len(test_returns)), ma_te, label=f"Test {ma_window}-MA")
+
+    plt.axhline(y=benchmark, linestyle="--", label=f"Benchmark {benchmark:.1f}")
+    if len(val_returns) > 0:
+        plt.axvline(x=len(train_returns), linestyle=":")
+    if len(test_returns) > 0:
+        plt.axvline(x=len(train_returns) + len(val_returns), linestyle=":")
+
+    plt.xlabel("Episode (Train + Val + Test)")
+    plt.ylabel("Return")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+
+    if show:
+        plt.show()
+    plt.close()
+# Time tracker
+from datetime import datetime
+import time
+
+def format_seconds(sec: float) -> str:
+    sec = float(sec)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if h > 0:
+        return f"{h}h {m}m {s:05.2f}s"
+    if m > 0:
+        return f"{m}m {s:05.2f}s"
+    return f"{s:.2f}s"
+
+# Defaults
+DATA_DIR_DEFAULT = "./data"
+DEFAULT_SEED = 13
+
+HEIGHT = 5
+WIDTH = 5
+CHANNELS = 10  
+NO_OF_ACTIONS = 5
+
+
+# Global numerical stability toggle.
+# If DEBUG_NUMERICS = True:
+# - Raise floating point errors (NumPy)
+# - Enable TensorFlow NaN/Inf checks
+# Keep False for normal training (faster execution).
+DEBUG_NUMERICS = False 
+  
+if DEBUG_NUMERICS:
+    np.seterr(all="raise")
+    tf.debugging.enable_check_numerics()
+else:
+    # faster / less intrusive
+    np.seterr(all="warn")
+
+
+
+# Reproducibility
+
+
+def set_global_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+    # Optional GPU memory growth
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
+
+
+
+# 1) Distance structures
+
+
+def _build_distance_structs(env):
+    """
+    Precompute and cache shortest-path distances on the grid.
+
+    Builds (once per env instance):
+    - _dist_from_idx_grids : list of distance-to-cell grids (one per node)
+    - _dist_base_grid      : distance grid to base location
+    - _dist_matrix         : full graph distance matrix
+    - _max_dist            : normalization constant
+
+    Variant 0/1: full 5x5 grid.
+    Variant 2/3: reduced graph with holes (custom mapping).
+    """
+    if hasattr(env, "_dist_ready") and env._dist_ready:
+        return
+
+    variant = env.variant
+    H, W = 5, 5
+
+    if variant in (0, 1):
+        neighbor_matrix = np.zeros((25, 25), dtype=int)
+        for i in range(25):
+            for j in range(i + 1, 25):
+                i_r, i_c = i // 5, i % 5
+                j_r, j_c = j // 5, j % 5
+                if ((j_r - i_r == 0 and j_c - i_c == 1) or
+                        (j_r - i_r == 1 and j_c - i_c == 0)):
+                    neighbor_matrix[i, j] = 1
+                    neighbor_matrix[j, i] = 1
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+        env._mapping = None
+        env._coord_to_idx = None
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(25):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j in range(25):
+                r = j // 5
+                c = j % 5
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+
+        env._dist_from_idx_grids = dist_grids
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = base_coord[0] * 5 + base_coord[1]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    else:
+        # Variant 2/3 mapping (holes)
+        mapping = [
+            (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+            (3, 1), (4, 1),
+            (0, 2), (1, 2), (2, 2), (3, 2), (4, 2),
+            (0, 3), (0, 4),
+            (1, 4), (2, 4), (3, 4), (4, 4)
+        ]
+        env._mapping = mapping
+        env._coord_to_idx = {coord: i for i, coord in enumerate(mapping)}
+
+        neighbor_matrix = np.zeros((18, 18), dtype=int)
+
+        def link(i, j):
+            neighbor_matrix[i, j] = 1
+            neighbor_matrix[j, i] = 1
+
+        link(0, 1); link(1, 2); link(2, 3); link(3, 4)
+        link(3, 5); link(4, 6); link(5, 6)
+        link(5, 10); link(6, 11)
+        link(7, 8); link(7, 12); link(8, 9); link(9, 10); link(10, 11)
+        link(12, 13); link(13, 14); link(14, 15); link(15, 16); link(16, 17)
+
+        graph = csr_matrix(neighbor_matrix)
+        dist_matrix, _ = dijkstra(csgraph=graph, directed=False, return_predecessors=True, unweighted=True)
+
+        env._dist_matrix = dist_matrix
+
+        dist_grids = []
+        for idx in range(len(mapping)):
+            grid = np.zeros((H, W), dtype=np.float32)
+            for j, coord in enumerate(mapping):
+                r, c = coord
+                grid[r, c] = dist_matrix[idx, j]
+            dist_grids.append(grid)
+
+        env._dist_from_idx_grids = dist_grids
+        base_coord = (env.vertical_idx_target, env.horizontal_idx_target)
+        idx_base = env._coord_to_idx[base_coord]
+        env._dist_base_grid = dist_grids[idx_base]
+
+        finite = dist_matrix[dist_matrix < np.inf]
+        env._max_dist = float(np.max(finite)) if finite.size > 0 else 1.0
+        if env._max_dist <= 0:
+            env._max_dist = 1.0
+
+    env._dist_ready = True
+
+
+def _coord_to_idx(env, coord):
+    """
+    Map (row, col) coordinate to graph node index used in distance arrays.
+
+    Variant 1: direct 5x5 flattening.
+    """
+    if env.variant in (0, 1):
+        return coord[0] * 5 + coord[1]
+    return env._coord_to_idx[coord]
+
+# 1b) Fast precomputed grids (eligible, and reusable index grids)
+
+
+def _ensure_fast_grids(env):
+    """
+    Precompute and cache helper grids for fast action masking.
+
+    - Builds a boolean eligible grid for O(1) movement checks.
+    - Safe to call multiple times (runs only once per env).
+    """
+    if getattr(env, "_fast_grids_ready", False):
+        return
+
+    H, W = HEIGHT, WIDTH
+
+    eligible = np.zeros((H, W), dtype=np.float32)
+    # Convert eligible_cells to a dense grid for O(1) lookup during action checks
+    for (r, c) in env.eligible_cells:
+        eligible[r, c] = 1.0
+    env._eligible_grid = eligible  # float32 0/1
+    env._eligible_grid_bool = eligible > 0.5
+
+    env._fast_grids_ready = True
+
+
+
+# 2) CNN observation encoding 
+
+def encode_obs(obs, env):
+    step, agent_loc, agent_load, item_locs, item_times = obs
+    _build_distance_structs(env)
+    _ensure_fast_grids(env)
+
+    H, W, C = HEIGHT, WIDTH, CHANNELS
+    state = np.zeros((H, W, C), dtype=np.float32)
+
+    # 6: eligible mask (precomputed)
+    state[:, :, 6] = env._eligible_grid
+
+    # 0: agent position
+    ar, ac = agent_loc
+    state[ar, ac, 0] = 1.0
+
+    # 1,2,5: items (vectorized)
+    if len(item_locs) > 0:
+        locs = np.asarray(item_locs, dtype=np.int32)          # (n,2)
+        ages = np.asarray(item_times, dtype=np.float32)       # (n,)
+        rr = locs[:, 0]
+        cc = locs[:, 1]
+        state[rr, cc, 1] = 1.0
+        state[rr, cc, 2] = ages / env.max_response_time
+        state[rr, cc, 5] = (env.max_response_time - ages) / env.max_response_time
+    else:
+        ages = None  # used later for phi; keep name
+
+    # 3: dist agent->cell (norm)
+    agent_idx = _coord_to_idx(env, agent_loc)
+    dist_agent_grid = env._dist_from_idx_grids[agent_idx]
+    max_dist = getattr(env, "_max_dist", 1.0)
+    if not np.isfinite(max_dist) or max_dist <= 0:
+        max_dist = 1.0
+    state[:, :, 3] = dist_agent_grid / max_dist
+
+    # 4: dist base->cell (norm)
+    state[:, :, 4] = env._dist_base_grid / max_dist
+
+    # 7: step norm
+    state[:, :, 7] = step / float(env.episode_steps)
+
+    # 8: load norm
+    state[:, :, 8] = agent_load / float(env.agent_capacity)
+
+    # 9: Phi plane
+    # PPO-equivalent formulation, vectorized.
+    # Blends item pressure and base pressure via load-dependent alpha.
+    # normalized distance grids
+    d_agent = dist_agent_grid / max_dist
+    d_base = env._dist_base_grid / max_dist
+    
+    best_ttl = 0.0
+    if len(item_locs) > 0:
+        # Select item maximizing: -dist_agent + 1.3*(1-ttl)
+        locs = np.asarray(item_locs, dtype=np.int32)
+        rr = locs[:, 0]
+        cc = locs[:, 1]
+
+        # ages already built above if items exist
+        ttl = (env.max_response_time - ages) / env.max_response_time
+        d = d_agent[rr, cc]
+        score = (-1.0 * d) + 1.3 * (1.0 - ttl)
+        best_ttl = float(ttl[int(np.argmax(score))])
+    # Base attraction term
+    base_term = -1.2 * d_base
+
+    cap = float(env.agent_capacity)
+    load = float(agent_load)
+     # Load-dependent blending regime
+    if load <= 0:
+        alpha = 0.00
+        detour_penalty = 1.0
+    elif load < cap:
+        frac = load / cap  # 1/3 or 2/3
+        if frac <= 0.34:
+            alpha = 0.25
+            detour_penalty = 1.2
+        else:
+            alpha = 0.70
+            detour_penalty = 1.5
+    else:
+        alpha = 1.00
+        detour_penalty = 1.8
+    # Item pressure term (distance penalized by detour factor)
+    item_term = -detour_penalty * d_agent + 1.3 * (1.0 - best_ttl)
+    # Final blended guidance field
+    phi_plane = (1.0 - alpha) * item_term + alpha * base_term
+    phi_plane = np.clip(phi_plane, -1.0, 1.0)
+
+    state[:, :, 9] = phi_plane
+    return state.reshape(-1)
+
+
+# 3) Action masking helper
+
+def compute_valid_actions(env):
+    """
+    Valid action masking for current env state.
+    Action 0 (idle) always valid.
+    Movement only into in-bounds and eligible cells.
+    """
+    _ensure_fast_grids(env)
+
+    valid = [0]  # idle always allowed
+    r, c = env.agent_loc
+    H, W = env.vertical_cell_count, env.horizontal_cell_count
+
+    # actions: (act, dr, dc)
+    moves = (
+        (1, -1, 0),  # up
+        (2, 0, 1),   # right
+        (3, 1, 0),   # down
+        (4, 0, -1),  # left
+    )
+    elig = env._eligible_grid_bool
+    for act, dr, dc in moves:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < H and 0 <= nc < W and elig[nr, nc]:
+            valid.append(act)
+    return np.asarray(valid, dtype=np.int32)
+
+
+# 4) Replay buffers (PER)
+
+class UniformReplayBuffer:
+    """
+    Standard replay buffer with uniform random sampling.
+    Mainly kept as fallback / baseline (PER is used by default).
+    """
+    def __init__(self, state_dim, capacity=50_000):
+        self.capacity = capacity
+        self.ptr = 0
+        self.n = 0
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = a
+        self.rewards[i] = r
+        self.next_states[i] = ns
+        self.dones[i] = d
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        idxs = np.random.randint(self.n, size=batch_size)
+        weights = np.ones((batch_size,), dtype=np.float32)
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            weights
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        pass
+
+
+class SumTree:
+    """
+    Binary sum-tree for proportional prioritized sampling.
+    Enables O(log N) priority updates and prefix-sum queries.
+    """
+    def __init__(self, capacity: int):
+        self.capacity = 1
+        while self.capacity < capacity:
+            self.capacity <<= 1
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def total(self):
+        return self.tree[1]
+
+    def add(self, p: float, idx: int):
+        i = idx + self.capacity
+        delta = p - self.tree[i]
+        self.tree[i] = p
+        i //= 2
+        while i >= 1:
+            self.tree[i] += delta
+            i //= 2
+
+    def find_prefixsum_idx(self, mass: float) -> int:
+        i = 1
+        while i < self.capacity:
+            left = 2 * i
+            if self.tree[left] >= mass:
+                i = left
+            else:
+                mass -= self.tree[left]
+                i = left + 1
+        return i - self.capacity
+
+
+class PrioritizedReplayBuffer:
+    """
+    Prioritized Experience Replay (PER).
+    Samples transitions proportional to priority^alpha
+    and applies importance-sampling weights (beta annealed).
+    """
+    def __init__(self, state_dim, capacity=50_000, alpha=0.6, beta0=0.4, beta_final=1.0,
+                 beta_anneal_steps=200_000, eps=1e-6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.eps = eps
+        self.beta0 = beta0
+        self.beta_final = beta_final
+        self.beta_anneal_steps = max(1, beta_anneal_steps)
+        self.ptr = 0
+        self.n = 0
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int32)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+        self.sumtree = SumTree(capacity)
+        self.max_priority = 1.0
+        self._beta_updates = 0
+
+    @property
+    def beta(self):
+        t = min(1.0, self._beta_updates / float(self.beta_anneal_steps))
+        return (1.0 - t) * self.beta0 + t * self.beta_final
+
+    def __len__(self):
+        return self.n
+
+    def add(self, s, a, r, ns, d):
+        i = self.ptr
+        self.states[i] = s
+        self.actions[i] = a
+        self.rewards[i] = r
+        self.next_states[i] = ns
+        self.dones[i] = d
+
+        p = (self.max_priority + self.eps) ** self.alpha
+        self.sumtree.add(p, i)
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.n = min(self.n + 1, self.capacity)
+
+    def sample(self, batch_size):
+        total = self.sumtree.total()
+        seg = total / max(1, batch_size)
+
+        idxs = []
+        for i in range(batch_size):
+            mass = np.random.uniform(i * seg, (i + 1) * seg)
+            idx = self.sumtree.find_prefixsum_idx(mass)
+            if idx >= self.n:
+                idx = np.random.randint(self.n)
+            idxs.append(idx)
+
+        idxs = np.array(idxs, dtype=np.int32)
+
+        leaf_idx = idxs + self.sumtree.capacity
+        p = self.sumtree.tree[leaf_idx]
+        p = np.clip(p, 1e-12, None)
+        P = p / max(1e-12, total)
+
+        self._beta_updates += 1
+        w = (self.n * P) ** (-self.beta)
+        w = w / (w.max() + 1e-12)
+
+        return (
+            self.states[idxs],
+            self.actions[idxs],
+            self.rewards[idxs],
+            self.next_states[idxs],
+            self.dones[idxs],
+            idxs,
+            w.astype(np.float32)
+        )
+
+    def update_priorities(self, idxs, td_errors):
+        prios = (np.abs(td_errors) + self.eps) ** self.alpha
+        self.max_priority = max(self.max_priority, float(np.max(prios)))
+        for i, p in zip(idxs, prios):
+            self.sumtree.add(float(p), int(i))
+
+
+
+# 5) Noisy layer
+
+class NoisyDense(tf.keras.layers.Layer):
+    """
+    Factorized Noisy Linear layer (NoisyNet).
+
+    Injects learnable parameter noise into Dense layers during training.
+    Used together with epsilon-greedy exploration in this agent.
+    Active only in training mode.
+    """
+    def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.activation = tf.keras.activations.get(activation)
+        self.sigma0 = float(sigma0)
+
+    def build(self, input_shape):
+        in_dim = int(input_shape[-1])
+        mu_range = 1.0 / np.sqrt(in_dim)
+
+        self.mu_w = self.add_weight(
+            name="mu_w",
+            shape=(in_dim, self.units),
+            initializer=tf.keras.initializers.RandomUniform(-mu_range, mu_range),
+            trainable=True,
+        )
+        self.sigma_w = self.add_weight(
+            name="sigma_w",
+            shape=(in_dim, self.units),
+            initializer=tf.keras.initializers.Constant(self.sigma0 / np.sqrt(in_dim)),
+            trainable=True,
+        )
+        self.mu_b = self.add_weight(
+            name="mu_b",
+            shape=(self.units,),
+            initializer=tf.keras.initializers.RandomUniform(-mu_range, mu_range),
+            trainable=True,
+        )
+        self.sigma_b = self.add_weight(
+            name="sigma_b",
+            shape=(self.units,),
+            initializer=tf.keras.initializers.Constant(self.sigma0 / np.sqrt(in_dim)),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        # Keras passes training=True/False automatically in many cases.
+        # If it's None, default to False (deterministic).
+        training = bool(training)
+
+        if training:
+            def f(x):
+                return tf.sign(x) * tf.sqrt(tf.abs(x) + 1e-12)
+
+            in_dim = tf.shape(self.mu_w)[0]
+            eps_in = f(tf.random.normal((in_dim,)))
+            eps_out = f(tf.random.normal((self.units,)))
+            eps_w = tf.tensordot(eps_in, eps_out, axes=0)
+            eps_b = eps_out
+
+            w = self.mu_w + self.sigma_w * eps_w
+            b = self.mu_b + self.sigma_b * eps_b
+        else:
+            # deterministic
+            w = self.mu_w
+            b = self.mu_b
+
+        out = tf.matmul(inputs, w) + b
+        if self.activation is not None:
+            out = self.activation(out)
+        return out
+
+
+# 6) DQN Agent with Masked ConvLSTM planner hea
+
+class DQN_Agent:
+    """
+    Noisy Dueling Double-DQN agent (variant 1) with action masking and PER.
+
+    Main idea: a CNN builds a spatial feature map, then a masked ConvLSTM "planner"
+    rolls those features for K steps only over eligible cells, and we read Q-values
+    at the agent position (dueling V/A decomposition).
+    """
+    def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
+        if agent_hyperparameters is None:
+            agent_hyperparameters = {}
+
+        self.state_size = int(state_size)
+        self.action_size = int(no_of_actions)
+        # Core DQN hyperparameters
+        self.gamma = agent_hyperparameters.get("gamma", 0.99)
+        self.epsilon = agent_hyperparameters.get("epsilon", 1.0)
+        self.batch_size = agent_hyperparameters.get("batch_size", 32)
+        self.epsilon_min = agent_hyperparameters.get("epsilon_min", 0.05)
+        self.epsilon_decay = agent_hyperparameters.get("epsilon_decay", 0.995)
+        self.units = agent_hyperparameters.get("units", 64)
+        
+        # Replay: PER is default (Uniform buffer kept as fallback / baseline)
+        self.use_per = agent_hyperparameters.get("use_per", True)
+        per_alpha = agent_hyperparameters.get("per_alpha", 0.6)
+        per_beta0 = agent_hyperparameters.get("per_beta0", 0.4)
+        per_beta1 = agent_hyperparameters.get("per_beta1", 1.0)
+        per_eps = agent_hyperparameters.get("per_eps", 1e-6)
+        per_anneal = agent_hyperparameters.get("per_beta_anneal_steps", 200_000)
+
+        # Optional n-step return (kept simple; default 1-step)
+        self.n_step = int(agent_hyperparameters.get("n_step", 1))
+        
+        # Optional NoisyNet exploration in Dense layers (training-only noise)
+        self.use_noisy = agent_hyperparameters.get("use_noisy", False)
+        self.noisy_sigma0 = agent_hyperparameters.get("noisy_sigma0", 0.5)
+
+        self.gamma_n = self.gamma ** self.n_step
+        
+        # Soft target update (Polyak averaging)
+        self.tau = agent_hyperparameters.get("tau", 0.001)
+
+        # Planner horizon: how many "internal planning" steps ConvLSTM sees
+        self.planner_steps = int(agent_hyperparameters.get("planner_steps", 8))
+
+        # Build online and target networks
+        self.model = self._build_model(self.state_size, self.action_size, old_model_path)
+        self.target_model = self._build_model(self.state_size, self.action_size)
+
+        self.target_model.set_weights(self.model.get_weights())
+
+        # Replay buffer
+        if self.use_per:
+            self.memory = PrioritizedReplayBuffer(
+                state_dim=self.state_size,
+                capacity=50_000,
+                alpha=per_alpha,
+                beta0=per_beta0,
+                beta_final=per_beta1,
+                beta_anneal_steps=per_anneal,
+                eps=per_eps,
+            )
+        else:
+            self.memory = UniformReplayBuffer(state_dim=self.state_size, capacity=50_000)
+
+        self.learn_start = max(5000, 5 * self.batch_size)
+        self.total_updates = 0
+        self._n_step_buffer = deque(maxlen=self.n_step)
+
+        # Per-sample huber (needed for PER importance weights)
+        self._huber_none = tf.keras.losses.Huber(delta=1.0, reduction=tf.keras.losses.Reduction.NONE)
+
+    def _dense_layer(self, units, activation=None):
+        # Switch between standard Dense and NoisyDense
+        if self.use_noisy:
+            return NoisyDense(units, activation=activation, sigma0=self.noisy_sigma0)
+        return Dense(units, activation=activation)
+
+    def _build_model(self, state_size, action_size, old_model_path=""):
+        K = int(self.planner_steps)
+        DenseLayer = self._dense_layer
+
+        inp = Input(shape=(state_size,))
+        grid = Reshape((HEIGHT, WIDTH, CHANNELS))(inp)
+        
+        # Split out the two key spatial masks from the observation encoding
+        eligible_mask = Lambda(lambda x: x[:, :, :, 6:7], name="eligible_mask")(grid)
+        agent_layer = Lambda(lambda x: x[:, :, :, 0:1], name="agent_layer")(grid)
+
+        # CNN feature extractor (spatial feature map)
+        x = Conv2D(32, kernel_size=3, padding="same", activation="relu")(grid)
+        x = Conv2D(64, kernel_size=3, padding="same", activation="relu")(x)
+
+        # Masked ConvLSTM Planner: Concatenate the eligible mask into the feature map, replicate it K times,
+        # and mask out features at each step so ConvLSTM only "plans" through valid cells
+        x_plus = tf.keras.layers.Concatenate(axis=-1, name="feat_plus_mask")([x, eligible_mask])
+
+        def repeat_k(t):
+            t = tf.expand_dims(t, axis=1)
+            return tf.tile(t, [1, K, 1, 1, 1])
+
+        seq = Lambda(repeat_k, name="repeat_K")(x_plus)
+        seq_feat = Lambda(lambda t: t[:, :, :, :, :-1], name="seq_feat")(seq)
+        seq_mask = Lambda(lambda t: t[:, :, :, :, -1:], name="seq_mask")(seq)
+        seq_feat = tf.keras.layers.Multiply(name="mask_feat_each_step")([seq_feat, seq_mask])
+
+        # ConvLSTM aggregates a short rollout of masked spatial dynamics
+        h_last = tf.keras.layers.ConvLSTM2D(
+            filters=64,
+            kernel_size=3,
+            padding="same",
+            return_sequences=False,
+            name="masked_convlstm_planner",
+        )(seq_feat)
+
+        # Final mask so invalid cells cannot influence downstream heads
+        h_last = tf.keras.layers.Multiply(name="final_mask_apply")([h_last, eligible_mask])
+
+        # Dueling heads on the spatial map (V(s) and A(s,a))
+        v_map = Conv2D(1, kernel_size=1, padding="same", name="v_map")(h_last)
+        a_map = Conv2D(action_size, kernel_size=1, padding="same", name="a_map")(h_last)
+
+        a_mean = Lambda(lambda a: tf.reduce_mean(a, axis=-1, keepdims=True), name="a_mean")(a_map)
+        a_centered = tf.keras.layers.Subtract(name="a_centered")([a_map, a_mean])
+        q_map = tf.keras.layers.Add(name="q_map")([v_map, a_centered])
+
+        # Read Q-values only at agent location (agent channel is a 1-hot map)
+        def gather_agent_q(args):
+            qmap, agent = args
+            b = tf.shape(qmap)[0]
+            Ht = tf.shape(qmap)[1]
+            Wt = tf.shape(qmap)[2]
+            flat = tf.reshape(agent, [b, Ht * Wt])
+            idx_flat = tf.argmax(flat, axis=1, output_type=tf.int32)
+            r = idx_flat // Wt
+            c = idx_flat % Wt
+            batch_idx = tf.range(b, dtype=tf.int32)
+            gather_idx = tf.stack([batch_idx, r, c], axis=1)
+            q = tf.gather_nd(qmap, gather_idx)  # (batch, action_size)
+            return q
+
+        q = Lambda(gather_agent_q, name="q_agent")([q_map, agent_layer])
+
+        model = Model(inputs=inp, outputs=q)
+        model.compile(
+            optimizer=Adam(learning_rate=3e-4, clipnorm=10.0),
+            loss=Huber(delta=1.0),
+            run_eagerly=False
+        )
+        if old_model_path:
+            model.load_weights(old_model_path)
+        return model
+    def select_action(self, state, valid_actions=None, training=True):
+        # valid_actions: list/array of allowed actions in the CURRENT state (from env mask)
+        if valid_actions is None:
+            valid_actions = np.arange(self.action_size, dtype=np.int32)
+        # Epsilon-greedy exploration (only during training)
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.choice(valid_actions))
+
+        # Greedy: predict Q(s, a) for all actions
+        q = self.model(state, training=False).numpy()[0]
+        
+        # Mask invalid actions by setting them to a very negative number
+        masked_q = np.full_like(q, -1e9, dtype=np.float32)
+        masked_q[valid_actions] = q[valid_actions]
+        return int(np.argmax(masked_q))
+
+    def _add_single_transition(self, state, action, reward, next_state, done):
+        self.memory.add(state.reshape(-1), int(action), float(reward), next_state.reshape(-1), float(done))
+
+    def record(self, state, action, reward, next_state, done):
+        # n-step support (default n_step=1 => store immediately
+        if self.n_step <= 1:
+            self._add_single_transition(state, action, reward, next_state, done)
+            return
+
+        self._n_step_buffer.append((state, action, reward, next_state, done))
+        # When we have n steps and episode continues -> flush one n-step transition
+        if len(self._n_step_buffer) == self.n_step and not done:
+            self._flush_n_step()
+            self._n_step_buffer.popleft()
+        if done:
+            while len(self._n_step_buffer) > 0:
+                self._flush_n_step()
+                self._n_step_buffer.popleft()
+
+    def _flush_n_step(self):
+        R = 0.0
+        gamma = 1.0
+        for (_, _, r, _, d) in self._n_step_buffer:
+            R += gamma * float(r)
+            gamma *= self.gamma
+            if d:
+                break
+        state_0, action_0, _, _, _ = self._n_step_buffer[0]
+        _, _, _, next_state_last, done_last = self._n_step_buffer[-1]
+        self._add_single_transition(state_0, action_0, R, next_state_last, done_last)
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+        for src, tgt in zip(self.model.weights, self.target_model.weights):
+            tgt.assign(tau * src + one_minus * tgt)
+
+    def _valid_action_mask_from_states(self, states):
+        # Rebuild action-validity mask from encoded state:
+        # - agent position is channel 0 (1-hot)
+        # - eligible grid is channel 6 (0/1)
+        batch = states.shape[0]
+        grid = states.reshape(batch, HEIGHT, WIDTH, CHANNELS)
+
+        mask = np.zeros((batch, self.action_size), dtype=bool)
+        mask[:, 0] = True
+
+        agent_layer = grid[:, :, :, 0]
+        eligible_layer = grid[:, :, :, 6] > 0.5
+
+        for b in range(batch):
+            pos = np.argwhere(agent_layer[b] > 0.5)
+            if pos.size == 0:
+                continue
+            ar, ac = pos[0]
+            moves = [(1, -1, 0), (2, 0, 1), (3, 1, 0), (4, 0, -1)]
+            for act, dr, dc in moves:
+                nr, nc = ar + dr, ac + dc
+                if 0 <= nr < HEIGHT and 0 <= nc < WIDTH and eligible_layer[b, nr, nc]:
+                    mask[b, act] = True
+        return mask
+
+    @tf.function
+    def _train_step_weighted_q(self, S, A, Tgt, is_w):
+        # One gradient step using weighted Huber loss (PER importance weights)
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)
+            per_sample = self._huber_none(Tgt, q_sa)
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
+    def update_weights(self):
+        # Don't start learning until buffer has enough samples
+        if len(self.memory) < self.learn_start:
+            return
+
+        S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
+        #mask next-state actions too (prevents bootstrapping from illegal moves)
+        valid_next_mask_np = self._valid_action_mask_from_states(NS)
+
+        # Tensor-only path (no .numpy() for q-values)
+        S_tf = tf.convert_to_tensor(S, dtype=tf.float32)
+        A_tf = tf.convert_to_tensor(A, dtype=tf.int32)
+        R_tf = tf.convert_to_tensor(R, dtype=tf.float32)
+        NS_tf = tf.convert_to_tensor(NS, dtype=tf.float32)
+        D_tf = tf.convert_to_tensor(D, dtype=tf.float32)
+        w_tf = tf.convert_to_tensor(is_w, dtype=tf.float32)
+
+        valid_mask_tf = tf.convert_to_tensor(valid_next_mask_np, dtype=tf.bool)
+        neg = tf.constant(-1e9, dtype=tf.float32)
+
+        # Online network selects best next action among valid actions
+        q_next_online = self.model(NS_tf, training=False)          # (B, A)
+        q_next_online = tf.where(valid_mask_tf, q_next_online, neg)
+        best_next_actions = tf.argmax(q_next_online, axis=1, output_type=tf.int32)  # (B,)
+
+        # Evaluate chosen actions on target network
+        q_next_target = self.target_model(NS_tf, training=False)   # (B, A)
+        q_next_target = tf.where(valid_mask_tf, q_next_target, neg)
+        gather_idx = tf.stack([tf.range(self.batch_size, dtype=tf.int32), best_next_actions], axis=1)
+        best_next_q = tf.gather_nd(q_next_target, gather_idx)      # (B,)
+
+        Tgt_tf = R_tf + (self.gamma_n * best_next_q * (1.0 - D_tf))
+
+        _, td_tf = self._train_step_weighted_q(S_tf, A_tf, Tgt_tf, w_tf)
+
+        if self.use_per:
+            # priorities update needs numpy (outside hot forward passes)
+            self.memory.update_priorities(idxs, tf.abs(td_tf).numpy())
+
+        self._soft_update_target()
+        self.total_updates += 1
+
+
+# 7) GymEnvironment wrapper (training loop + checkpoint cycles)
+
+
+class GymEnvironment:
+    """
+    Training/eval wrapper around the Environment.
+
+    Runs DQN episodes with action-masking, periodic updates, and
+    train→validate cycles with checkpointing + best-validation selection.
+    """
+    def __init__(self, env_id=None, save_path="./save", render=False, variant=1, data_dir="./data"):
+        self.env = Environment(variant=variant, data_dir=data_dir)
+        self.variant = variant
+        self.max_timesteps = getattr(self.env, "episode_steps", 200)
+        self.save_path = save_path
+
+        # Optional: precompute grids once (safe, but encode_obs also calls it)
+        _build_distance_structs(self.env)
+        _ensure_fast_grids(self.env)
+
+    def runDQN(self, agent, no_episodes, training=False, print_interval=25):
+        rew = np.zeros(no_episodes, dtype=np.float32)
+
+        for episode in range(no_episodes):
+            # update frequency schedule
+            if training:
+                if episode < 400:
+                    update_every = 8
+                else:
+                    update_every = 4
+            else:
+                update_every = 4
+
+            obs = self.env.reset(mode="training" if training else "validation")
+
+            # ensure fast grids exist after reset (if env changes eligible_cells per reset)
+            _ensure_fast_grids(self.env)
+
+            state_vec = encode_obs(obs, self.env).reshape(1, -1)
+
+            done = 0
+            rwd = 0.0
+            t = 0
+            step_since_update = 0
+
+            while not done and t < self.max_timesteps:
+                valid_actions = compute_valid_actions(self.env)
+                action = agent.select_action(state_vec, valid_actions=valid_actions, training=training)
+
+                reward, next_obs, done = self.env.step(action)
+                next_state_vec = encode_obs(next_obs, self.env).reshape(1, -1)
+
+                rwd += reward
+                truncated = (t + 1 >= self.max_timesteps)
+                terminal_flag = float(done or truncated)
+
+                if training:
+                    agent.record(state_vec, action, reward, next_state_vec, terminal_flag)
+                    step_since_update += 1
+                    if step_since_update % update_every == 0:
+                        agent.update_weights()
+
+                state_vec = next_state_vec
+                t += 1
+                if truncated:
+                    break
+
+            rew[episode] = rwd
+
+            if training:
+                if print_interval and (episode + 1) % int(print_interval) == 0:
+                    start = max(0, episode + 1 - int(print_interval))
+                    avgk = float(np.mean(rew[start:episode + 1]))
+                    print(f"[TRAIN] Variant {self.variant} Ep {episode + 1}/{no_episodes} "
+                          f"Return={rwd:.1f}  Avg{print_interval}={avgk:.1f}")
+                agent.update_epsilon()
+
+        return rew
+
+    def train_validate_cycle(
+        self,
+        agent,
+        total_train_episodes,
+        chunk_train_episodes=50,
+        val_episodes=50,
+        combo_tag="run",
+        data_dir="./data",
+        print_interval=25,
+    ):
+        os.makedirs(self.save_path, exist_ok=True)
+
+        # FIXED validation env (always same validation episodes)
+        env_val_fixed = Environment(self.variant, data_dir)
+        env_val_fixed.validation_episodes = env_val_fixed.validation_episodes[:val_episodes]
+
+        best_val = -1e18
+        best_path = None
+        best_at_ep = 0
+
+        all_train_rewards = []
+        trained = 0
+
+        while trained < total_train_episodes:
+            n = min(chunk_train_episodes, total_train_episodes - trained)
+
+            # train chunk
+            chunk_rewards = self.runDQN(
+                agent,
+                n,
+                training=True,
+                print_interval=print_interval,
+            )
+            all_train_rewards.append(chunk_rewards)
+            trained += n
+
+            # save checkpoint
+            safe_tag = combo_tag.replace(" ", "_") if combo_tag else "run"
+            ckpt_name = f"{safe_tag}_variant{self.variant}_ep{trained}.weights.h5"
+            ckpt_path = os.path.join(self.save_path, ckpt_name)
+            agent.model.save_weights(ckpt_path, overwrite=True)
+
+            # eval on fixed validation 
+            env_val_fixed.validation_episode_counter = 0
+            avg_val = evaluate_on_env(agent, env_val_fixed, episodes=val_episodes, mode="validation")
+
+            print(f"[CYCLE] trained={trained}/{total_train_episodes} | saved={ckpt_name} | "
+                  f"val_avg({val_episodes}-fixed)={avg_val:.3f}")
+
+            if avg_val > best_val:
+                best_val = float(avg_val)
+                best_path = ckpt_path
+                best_at_ep = int(trained)
+                print(f"[BEST] new best val({val_episodes}-fixed)={best_val:.3f} at train_ep={best_at_ep} "
+                      f"-> {os.path.basename(best_path)}")
+
+        all_train_rewards = np.concatenate(all_train_rewards).astype(np.float32)
+        return all_train_rewards, best_val, best_path, best_at_ep
+
+
+
+# 8) Evaluation helpers
+
+def evaluate_on_env(agent, env, episodes=100, mode="validation"):
+    """
+    Evaluate agent with greedy policy (no exploration).
+
+    Returns mean return over validation/testing episodes.
+    """
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+
+    if mode == "testing":
+        max_eps = min(episodes, len(env.test_episodes))
+    elif mode == "validation":
+        max_eps = min(episodes, len(env.validation_episodes))
+    else:
+        max_eps = episodes
+
+    total = 0.0
+
+    for _ in range(max_eps):
+        obs = env.reset(mode)
+        _ensure_fast_grids(env)
+        s_vec = encode_obs(obs, env).reshape(1, -1)
+
+        done = 0
+        ep_ret = 0.0
+        steps = 0
+
+        while not done and steps < max_steps:
+            valid_actions = compute_valid_actions(env)
+            a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
+            r, nxt, done = env.step(a)
+            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            ep_ret += r
+            steps += 1
+
+        total += ep_ret
+
+    return total / float(max_eps)
+
+
+def evaluate_on_env_returns(agent, env, episodes=100, mode="validation"):
+    max_steps = min(getattr(env, "episode_steps", 200), 200)
+
+    if mode == "testing":
+        max_eps = min(episodes, len(env.test_episodes))
+    elif mode == "validation":
+        max_eps = min(episodes, len(env.validation_episodes))
+    else:
+        max_eps = episodes
+
+    returns = np.zeros(max_eps, dtype=np.float32)
+
+    for ep in range(max_eps):
+        obs = env.reset(mode)
+        _ensure_fast_grids(env)
+        s_vec = encode_obs(obs, env).reshape(1, -1)
+
+        done = 0
+        ep_ret = 0.0
+        steps = 0
+
+        while not done and steps < max_steps:
+            valid_actions = compute_valid_actions(env)
+            a = agent.select_action(s_vec, valid_actions=valid_actions, training=False)
+            r, nxt, done = env.step(a)
+            s_vec = encode_obs(nxt, env).reshape(1, -1)
+            ep_ret += r
+            steps += 1
+
+        returns[ep] = ep_ret
+
+    return returns
+
+
+# 9) MAIN
+    """Train in chunks with validation checkpoints, then evaluate best model on val/test and save results."""
+
+if __name__ == "__main__":
+    import json
+    import time
+
+    VARIANT = 1
+    DATA_DIR = "./data"
+
+    TRAIN_EPISODES_FULL = 800
+    CHUNK_TRAIN = 50
+    VAL_EPISODES_FAST = 50
+    VAL_EPISODES_FINAL = 100
+    TEST_EPISODES_FINAL = 100
+    NO_OF_ACTIONS = 5
+
+    SEEDS = [10]
+
+    base_cfg = dict(
+        gamma=0.929,
+        epsilon=1.0,
+        epsilon_decay=0.99,
+        epsilon_min=0.079,
+        batch_size=32,
+        units=128,
+        tau=0.0010323839507959762,
+        use_per=True,
+        per_alpha=0.4,
+        per_beta0=0.2,
+        per_beta1=1.0,
+        per_eps=1e-6,
+        per_beta_anneal_steps=200_000,
+        replay_capacity=50_000,
+        learn_start=5000,
+        use_noisy=True,
+        noisy_sigma0=0.12546649741233012,
+    )
+
+    root_save = os.path.join(os.getcwd(), "seed_sweep_gamma_0_929")
+    os.makedirs(root_save, exist_ok=True)
+
+    results = []
+
+    for seed in SEEDS:
+        # reproducibility
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        tf.random.set_seed(seed)
+
+        run_tag = f"gamma0.929_seed{seed}"
+        save_folder = os.path.join(root_save, run_tag)
+        os.makedirs(save_folder, exist_ok=True)
+
+        # infer state size
+        env_tmp = Environment(variant=VARIANT, data_dir=DATA_DIR)
+        obs0 = env_tmp.reset("training")
+        _ensure_fast_grids(env_tmp)
+        state_size = encode_obs(obs0, env_tmp).shape[0]
+
+        agent = DQN_Agent(state_size, NO_OF_ACTIONS, base_cfg)
+
+        env_train = GymEnvironment(
+            variant=VARIANT,
+            data_dir=DATA_DIR,
+            save_path=save_folder,
+        )
+
+        run_start_wall = datetime.now()
+        run_start_perf = time.perf_counter()
+
+        print(f"[TIME] START: {run_start_wall.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # 50 train → 50 fixed val cycle
+        train_rewards, best_val_50, best_ckpt_path, best_at_ep = env_train.train_validate_cycle(
+            agent,
+            total_train_episodes=TRAIN_EPISODES_FULL,
+            chunk_train_episodes=CHUNK_TRAIN,
+            val_episodes=VAL_EPISODES_FAST,
+            combo_tag=run_tag,
+            data_dir=DATA_DIR,
+            print_interval=25,
+        )
+
+        run_end_wall = datetime.now()
+        run_total = time.perf_counter() - run_start_perf
+
+        print(f"[TIME] END  : {run_end_wall.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[TIME] TOTAL: {format_seconds(run_total)}")
+
+        # load best checkpoint
+        agent.model.load_weights(best_ckpt_path)
+        agent.target_model.set_weights(agent.model.get_weights())
+
+        # final validation + test over full 100 epidodes
+        env_val_final = Environment(variant=VARIANT, data_dir=DATA_DIR)
+        env_test_final = Environment(variant=VARIANT, data_dir=DATA_DIR)
+
+        val_returns = evaluate_on_env_returns(
+            agent,
+            env_val_final,
+            episodes=VAL_EPISODES_FINAL,
+            mode="validation",
+        )
+
+        test_returns = evaluate_on_env_returns(
+            agent,
+            env_test_final,
+            episodes=TEST_EPISODES_FINAL,
+            mode="testing",
+        )
+        plot_train_val_test(
+          train_returns=train_rewards,
+          val_returns=val_returns,
+          test_returns=test_returns,
+          benchmark=384.255, 
+          ma_window=25,
+          title=f"Variant {VARIANT} | gamma=0.929 | seed={seed}",
+          save_path=os.path.join(save_folder, "returns_plot.png")
+        )
+
+        rec = dict(
+            gamma=0.929,
+            seed=int(seed),
+            best_val_50=float(best_val_50),
+            best_at_ep=int(best_at_ep),
+            final_val_mean=float(np.mean(val_returns)),
+            final_test_mean=float(np.mean(test_returns)),
+            runtime_sec=float(run_total),
+            best_ckpt_path=str(best_ckpt_path),
+        )
+
+        results.append(rec)
+
+        print(
+            f"[SEED DONE] seed={seed} | "
+            f"best_val_50={rec['best_val_50']:.3f} | "
+            f"final_val={rec['final_val_mean']:.3f} | "
+            f"final_test={rec['final_test_mean']:.3f}"
+        )
+
+        with open(os.path.join(save_folder, "result.json"), "w") as f:
+            json.dump(rec, f, indent=2)
+
+    # summary across seeds
+    with open(os.path.join(root_save, "all_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    vals = np.array([r["final_val_mean"] for r in results], dtype=np.float32)
+    tests = np.array([r["final_test_mean"] for r in results], dtype=np.float32)
+
+    print("\nSUMMARY (gamma=0.929):")
+    print(f"val_mean={vals.mean():.3f} ± {vals.std(ddof=1):.3f}")
+    print(f"test_mean={tests.mean():.3f} ± {tests.std(ddof=1):.3f}")
