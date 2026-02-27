@@ -37,18 +37,14 @@ WIDTH = 5
 CHANNELS = 10  
 NO_OF_ACTIONS = 5
 
-# Debug / Numerics
-  """
-  Global numerical stability toggle.
 
-  If DEBUG_NUMERICS = True:
-  - Raise floating point errors (NumPy)
-  - Enable TensorFlow NaN/Inf checks
-
-  Keep False for normal training (faster execution).
-  """
-
+# Global numerical stability toggle.
+# If DEBUG_NUMERICS = True:
+# - Raise floating point errors (NumPy)
+# - Enable TensorFlow NaN/Inf checks
+# Keep False for normal training (faster execution).
 DEBUG_NUMERICS = False 
+  
 if DEBUG_NUMERICS:
     np.seterr(all="raise")
     tf.debugging.enable_check_numerics()
@@ -188,11 +184,11 @@ def _build_distance_structs(env):
 
 
 def _coord_to_idx(env, coord):
-  """
-  Map (row, col) coordinate to graph node index used in distance arrays.
+    """
+    Map (row, col) coordinate to graph node index used in distance arrays.
 
-  Variant 1: direct 5x5 flattening.
-  """
+    Variant 1: direct 5x5 flattening.
+    """
     if env.variant in (0, 1):
         return coord[0] * 5 + coord[1]
     return env._coord_to_idx[coord]
@@ -201,12 +197,12 @@ def _coord_to_idx(env, coord):
 
 
 def _ensure_fast_grids(env):
-  """
-  Precompute and cache helper grids for fast action masking.
+    """
+    Precompute and cache helper grids for fast action masking.
 
-  - Builds a boolean eligible grid for O(1) movement checks.
-  - Safe to call multiple times (runs only once per env).
-  """
+    - Builds a boolean eligible grid for O(1) movement checks.
+    - Safe to call multiple times (runs only once per env).
+    """
     if getattr(env, "_fast_grids_ready", False):
         return
 
@@ -321,11 +317,11 @@ def encode_obs(obs, env):
 # 3) Action masking helper
 
 def compute_valid_actions(env):
-  """
-  Valid action masking for current env state.
-  Action 0 (idle) always valid.
-  Movement only into in-bounds and eligible cells.
-  """
+    """
+    Valid action masking for current env state.
+    Action 0 (idle) always valid.
+    Movement only into in-bounds and eligible cells.
+    """
     _ensure_fast_grids(env)
 
     valid = [0]  # idle always allowed
@@ -350,10 +346,10 @@ def compute_valid_actions(env):
 # 4) Replay buffers (PER)
 
 class UniformReplayBuffer:
-  """
-  Standard replay buffer with uniform random sampling.
-  Mainly kept as fallback / baseline (PER is used by default).
-  """
+    """
+    Standard replay buffer with uniform random sampling.
+    Mainly kept as fallback / baseline (PER is used by default).
+    """
     def __init__(self, state_dim, capacity=50_000):
         self.capacity = capacity
         self.ptr = 0
@@ -395,10 +391,10 @@ class UniformReplayBuffer:
 
 
 class SumTree:
-  """
-  Binary sum-tree for proportional prioritized sampling.
-  Enables O(log N) priority updates and prefix-sum queries.
-  """
+    """
+    Binary sum-tree for proportional prioritized sampling.
+    Enables O(log N) priority updates and prefix-sum queries.
+    """
     def __init__(self, capacity: int):
         self.capacity = 1
         while self.capacity < capacity:
@@ -430,11 +426,11 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-  """
-  Prioritized Experience Replay (PER).
-  Samples transitions proportional to priority^alpha
-  and applies importance-sampling weights (beta annealed).
-  """
+    """
+    Prioritized Experience Replay (PER).
+    Samples transitions proportional to priority^alpha
+    and applies importance-sampling weights (beta annealed).
+    """
     def __init__(self, state_dim, capacity=50_000, alpha=0.6, beta0=0.4, beta_final=1.0,
                  beta_anneal_steps=200_000, eps=1e-6):
         self.capacity = capacity
@@ -520,13 +516,13 @@ class PrioritizedReplayBuffer:
 # 5) Noisy layer
 
 class NoisyDense(tf.keras.layers.Layer):
-  """
-  Factorized Noisy Linear layer (NoisyNet).
+    """
+    Factorized Noisy Linear layer (NoisyNet).
 
-  Injects learnable parameter noise into Dense layers during training.
-  Used together with epsilon-greedy exploration in this agent.
-  Active only in training mode.
-  """
+    Injects learnable parameter noise into Dense layers during training.
+    Used together with epsilon-greedy exploration in this agent.
+    Active only in training mode.
+    """
     def __init__(self, units, activation=None, sigma0=0.5, **kwargs):
         super().__init__(**kwargs)
         self.units = units
@@ -735,7 +731,144 @@ class DQN_Agent:
         if old_model_path:
             model.load_weights(old_model_path)
         return model
+    def select_action(self, state, valid_actions=None, training=True):
+        # valid_actions: list/array of allowed actions in the CURRENT state (from env mask)
+        if valid_actions is None:
+            valid_actions = np.arange(self.action_size, dtype=np.int32)
+        # Epsilon-greedy exploration (only during training)
+        if training and np.random.rand() < self.epsilon:
+            return int(np.random.choice(valid_actions))
 
+        # Greedy: predict Q(s, a) for all actions
+        q = self.model(state, training=False).numpy()[0]
+        
+        # Mask invalid actions by setting them to a very negative number
+        masked_q = np.full_like(q, -1e9, dtype=np.float32)
+        masked_q[valid_actions] = q[valid_actions]
+        return int(np.argmax(masked_q))
+
+    def _add_single_transition(self, state, action, reward, next_state, done):
+        self.memory.add(state.reshape(-1), int(action), float(reward), next_state.reshape(-1), float(done))
+
+    def record(self, state, action, reward, next_state, done):
+        # n-step support (default n_step=1 => store immediately
+        if self.n_step <= 1:
+            self._add_single_transition(state, action, reward, next_state, done)
+            return
+
+        self._n_step_buffer.append((state, action, reward, next_state, done))
+        # When we have n steps and episode continues -> flush one n-step transition
+        if len(self._n_step_buffer) == self.n_step and not done:
+            self._flush_n_step()
+            self._n_step_buffer.popleft()
+        if done:
+            while len(self._n_step_buffer) > 0:
+                self._flush_n_step()
+                self._n_step_buffer.popleft()
+
+    def _flush_n_step(self):
+        R = 0.0
+        gamma = 1.0
+        for (_, _, r, _, d) in self._n_step_buffer:
+            R += gamma * float(r)
+            gamma *= self.gamma
+            if d:
+                break
+        state_0, action_0, _, _, _ = self._n_step_buffer[0]
+        _, _, _, next_state_last, done_last = self._n_step_buffer[-1]
+        self._add_single_transition(state_0, action_0, R, next_state_last, done_last)
+
+    def update_epsilon(self):
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def _soft_update_target(self):
+        tau = float(self.tau)
+        one_minus = 1.0 - tau
+        for src, tgt in zip(self.model.weights, self.target_model.weights):
+            tgt.assign(tau * src + one_minus * tgt)
+
+    def _valid_action_mask_from_states(self, states):
+        # Rebuild action-validity mask from encoded state:
+        # - agent position is channel 0 (1-hot)
+        # - eligible grid is channel 6 (0/1)
+        batch = states.shape[0]
+        grid = states.reshape(batch, HEIGHT, WIDTH, CHANNELS)
+
+        mask = np.zeros((batch, self.action_size), dtype=bool)
+        mask[:, 0] = True
+
+        agent_layer = grid[:, :, :, 0]
+        eligible_layer = grid[:, :, :, 6] > 0.5
+
+        for b in range(batch):
+            pos = np.argwhere(agent_layer[b] > 0.5)
+            if pos.size == 0:
+                continue
+            ar, ac = pos[0]
+            moves = [(1, -1, 0), (2, 0, 1), (3, 1, 0), (4, 0, -1)]
+            for act, dr, dc in moves:
+                nr, nc = ar + dr, ac + dc
+                if 0 <= nr < HEIGHT and 0 <= nc < WIDTH and eligible_layer[b, nr, nc]:
+                    mask[b, act] = True
+        return mask
+
+    @tf.function
+    def _train_step_weighted_q(self, S, A, Tgt, is_w):
+        # One gradient step using weighted Huber loss (PER importance weights)
+        with tf.GradientTape() as tape:
+            q_all = self.model(S, training=True)
+            idx = tf.stack([tf.range(tf.shape(A)[0]), A], axis=1)
+            q_sa = tf.gather_nd(q_all, idx)
+            per_sample = self._huber_none(Tgt, q_sa)
+            loss = tf.reduce_mean(is_w * per_sample)
+
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        td = Tgt - q_sa
+        return loss, td
+
+    def update_weights(self):
+        # Don't start learning until buffer has enough samples
+        if len(self.memory) < self.learn_start:
+            return
+
+        S, A, R, NS, D, idxs, is_w = self.memory.sample(self.batch_size)
+        #mask next-state actions too (prevents bootstrapping from illegal moves)
+        valid_next_mask_np = self._valid_action_mask_from_states(NS)
+
+        # Tensor-only path (no .numpy() for q-values)
+        S_tf = tf.convert_to_tensor(S, dtype=tf.float32)
+        A_tf = tf.convert_to_tensor(A, dtype=tf.int32)
+        R_tf = tf.convert_to_tensor(R, dtype=tf.float32)
+        NS_tf = tf.convert_to_tensor(NS, dtype=tf.float32)
+        D_tf = tf.convert_to_tensor(D, dtype=tf.float32)
+        w_tf = tf.convert_to_tensor(is_w, dtype=tf.float32)
+
+        valid_mask_tf = tf.convert_to_tensor(valid_next_mask_np, dtype=tf.bool)
+        neg = tf.constant(-1e9, dtype=tf.float32)
+
+        # Online network selects best next action among valid actions
+        q_next_online = self.model(NS_tf, training=False)          # (B, A)
+        q_next_online = tf.where(valid_mask_tf, q_next_online, neg)
+        best_next_actions = tf.argmax(q_next_online, axis=1, output_type=tf.int32)  # (B,)
+
+        # Evaluate chosen actions on target network
+        q_next_target = self.target_model(NS_tf, training=False)   # (B, A)
+        q_next_target = tf.where(valid_mask_tf, q_next_target, neg)
+        gather_idx = tf.stack([tf.range(self.batch_size, dtype=tf.int32), best_next_actions], axis=1)
+        best_next_q = tf.gather_nd(q_next_target, gather_idx)      # (B,)
+
+        Tgt_tf = R_tf + (self.gamma_n * best_next_q * (1.0 - D_tf))
+
+        _, td_tf = self._train_step_weighted_q(S_tf, A_tf, Tgt_tf, w_tf)
+
+        if self.use_per:
+            # priorities update needs numpy (outside hot forward passes)
+            self.memory.update_priorities(idxs, tf.abs(td_tf).numpy())
+
+        self._soft_update_target()
+        self.total_updates += 1
 
 
 # 7) GymEnvironment wrapper (training loop + checkpoint cycles)
