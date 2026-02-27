@@ -584,13 +584,13 @@ class NoisyDense(tf.keras.layers.Layer):
 # 6) DQN Agent with Masked ConvLSTM planner hea
 
 class DQN_Agent:
-  """
-  Noisy Dueling Double-DQN agent (variant 1) with action masking and PER.
+    """
+    Noisy Dueling Double-DQN agent (variant 1) with action masking and PER.
 
-  Main idea: a CNN builds a spatial feature map, then a masked ConvLSTM "planner"
-  rolls those features for K steps only over eligible cells, and we read Q-values
-  at the agent position (dueling V/A decomposition).
-  """
+    Main idea: a CNN builds a spatial feature map, then a masked ConvLSTM "planner"
+    rolls those features for K steps only over eligible cells, and we read Q-values
+    at the agent position (dueling V/A decomposition).
+    """
     def __init__(self, state_size, no_of_actions, agent_hyperparameters=None, old_model_path=""):
         if agent_hyperparameters is None:
             agent_hyperparameters = {}
@@ -620,16 +620,6 @@ class DQN_Agent:
         self.use_noisy = agent_hyperparameters.get("use_noisy", False)
         self.noisy_sigma0 = agent_hyperparameters.get("noisy_sigma0", 0.5)
 
-        # Optional distributional head (not used in this run unless enabled
-        self.use_distributional = agent_hyperparameters.get("use_distributional", False)
-        self.num_atoms = int(agent_hyperparameters.get("num_atoms", 51))
-        self.vmin = float(agent_hyperparameters.get("vmin", -200.0))
-        self.vmax = float(agent_hyperparameters.get("vmax", 200.0))
-        if self.use_distributional:
-            self.z = np.linspace(self.vmin, self.vmax, self.num_atoms).astype(np.float32)
-        else:
-            self.z = None
-
         self.gamma_n = self.gamma ** self.n_step
         
         # Soft target update (Polyak averaging)
@@ -638,13 +628,9 @@ class DQN_Agent:
         # Planner horizon: how many "internal planning" steps ConvLSTM sees
         self.planner_steps = int(agent_hyperparameters.get("planner_steps", 8))
 
-        # # Build networks (online + target)
-        if self.use_distributional:
-            self.model = self._build_distributional_model(self.state_size, self.action_size, old_model_path)
-            self.target_model = self._build_distributional_model(self.state_size, self.action_size)
-        else:
-            self.model = self._build_model(self.state_size, self.action_size, old_model_path)
-            self.target_model = self._build_model(self.state_size, self.action_size)
+        # Build online and target networks
+        self.model = self._build_model(self.state_size, self.action_size, old_model_path)
+        self.target_model = self._build_model(self.state_size, self.action_size)
 
         self.target_model.set_weights(self.model.get_weights())
 
@@ -750,14 +736,18 @@ class DQN_Agent:
             model.load_weights(old_model_path)
         return model
 
-Read Q-values only at agent location (agent channel is a 1-hot map)
-
 
 
 # 7) GymEnvironment wrapper (training loop + checkpoint cycles)
 
 
 class GymEnvironment:
+    """
+    Training/eval wrapper around the Environment.
+
+    Runs DQN episodes with action-masking, periodic updates, and
+    train→validate cycles with checkpointing + best-validation selection.
+    """
     def __init__(self, env_id=None, save_path="./save", render=False, variant=1, data_dir="./data"):
         self.env = Environment(variant=variant, data_dir=data_dir)
         self.variant = variant
@@ -891,6 +881,11 @@ class GymEnvironment:
 # 8) Evaluation helpers
 
 def evaluate_on_env(agent, env, episodes=100, mode="validation"):
+    """
+    Evaluate agent with greedy policy (no exploration).
+
+    Returns mean return over validation/testing episodes.
+    """
     max_steps = min(getattr(env, "episode_steps", 200), 200)
 
     if mode == "testing":
@@ -959,7 +954,7 @@ def evaluate_on_env_returns(agent, env, episodes=100, mode="validation"):
 
 
 # 9) MAIN
-
+    """Train in chunks with validation checkpoints, then evaluate best model on val/test and save results."""
 
 if __name__ == "__main__":
     import json
