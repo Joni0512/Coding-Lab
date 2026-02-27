@@ -12,7 +12,7 @@ import faulthandler; faulthandler.enable()
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from env_midterm import Environment
+from Environment import Environment
 
 from tensorflow.keras import Model, Input
 from tensorflow.keras.layers import Dense, Lambda, Reshape, Conv2D, Flatten
@@ -37,7 +37,7 @@ def moving_average(x, window=25):
     return np.convolve(x, kernel, mode="valid")
 
 def plot_train_val_test(train_returns, val_returns, test_returns,
-                        benchmark=216.9, ma_window=25,
+                        benchmark=384.55, ma_window=25,
                         title="DQN Returns", save_path=None, show=True):
     train_returns = np.asarray(train_returns, dtype=np.float32)
     val_returns   = np.asarray(val_returns, dtype=np.float32)
@@ -619,18 +619,28 @@ class NoisyDense(tf.keras.layers.Layer):
         )
         super().build(input_shape)
 
-    def call(self, inputs):
-        def f(x):
-            return tf.sign(x) * tf.sqrt(tf.abs(x))
+    def call(self, inputs, training=None):
+        # Keras passes training=True/False automatically in many cases.
+        # If it's None, default to False (deterministic).
+        training = bool(training)
 
-        in_dim = tf.shape(self.mu_w)[0]
-        eps_in = f(tf.random.normal((in_dim,)))
-        eps_out = f(tf.random.normal((self.units,)))
-        eps_w = tf.tensordot(eps_in, eps_out, axes=0)
-        eps_b = eps_out
+        if training:
+            def f(x):
+                return tf.sign(x) * tf.sqrt(tf.abs(x) + 1e-12)
 
-        w = self.mu_w + self.sigma_w * eps_w
-        b = self.mu_b + self.sigma_b * eps_b
+            in_dim = tf.shape(self.mu_w)[0]
+            eps_in = f(tf.random.normal((in_dim,)))
+            eps_out = f(tf.random.normal((self.units,)))
+            eps_w = tf.tensordot(eps_in, eps_out, axes=0)
+            eps_b = eps_out
+
+            w = self.mu_w + self.sigma_w * eps_w
+            b = self.mu_b + self.sigma_b * eps_b
+        else:
+            # deterministic
+            w = self.mu_w
+            b = self.mu_b
+
         out = tf.matmul(inputs, w) + b
         if self.activation is not None:
             out = self.activation(out)
@@ -1215,8 +1225,6 @@ if __name__ == "__main__":
             save_path=save_folder,
         )
 
-        t0 = time.time()
-
         # 50 train → 50 fixed val cycle
         train_rewards, best_val_50, best_ckpt_path, best_at_ep = env_train.train_validate_cycle(
             agent,
@@ -1228,7 +1236,6 @@ if __name__ == "__main__":
             print_interval=25,
         )
 
-        t1 = time.time()
 
         # load best checkpoint
         agent.model.load_weights(best_ckpt_path)
@@ -1268,7 +1275,6 @@ if __name__ == "__main__":
             best_at_ep=int(best_at_ep),
             final_val_mean=float(np.mean(val_returns)),
             final_test_mean=float(np.mean(test_returns)),
-            runtime_sec=float(t1 - t0),
             best_ckpt_path=str(best_ckpt_path),
         )
 
